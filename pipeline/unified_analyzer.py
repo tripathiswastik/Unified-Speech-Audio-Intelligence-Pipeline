@@ -35,6 +35,10 @@ class UnifiedAudioAnalyzer:
 
         # 2. Emotion Classifier (RAVDESS)
         self.emotion_model = EmotionClassifierCNN()
+        emo_chk = CHECKPOINTS_DIR / "best_emotion_model.pt"
+        if emo_chk.exists():
+            emo_state = torch.load(emo_chk, map_location="cpu")
+            self.emotion_model.load_state_dict(emo_state["model_state"])
         self.emotion_model.eval()
 
         # 3. Speaker ID & Diarizer
