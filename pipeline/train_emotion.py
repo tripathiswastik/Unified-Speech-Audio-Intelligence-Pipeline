@@ -14,17 +14,23 @@ from pipeline.emotion_model import EmotionClassifierCNN
 from pipeline.ruflo_tracker import RufloExperimentTracker
 
 
-def train_emotion_epoch(model, loader, criterion, optimizer, device):
+import time
+from pipeline.device import get_device
+
+
+def train_emotion_epoch(model, loader, criterion, optimizer, device, epoch_idx: int, total_epochs: int):
     model.train()
     total_loss = 0.0
-    for specs, labels, _ in loader:
-        specs, labels = specs.to(device), labels.to(device)
+    pbar = tqdm(loader, desc=f"Epoch [{epoch_idx:02d}/{total_epochs:02d}] Training", leave=False)
+    for specs, labels, _ in pbar:
+        specs, labels = specs.to(device, non_blocking=True), labels.to(device, non_blocking=True)
         optimizer.zero_grad()
         outputs = model(specs)
         loss = criterion(outputs, labels)
         loss.backward()
         optimizer.step()
         total_loss += loss.item() * len(labels)
+        pbar.set_postfix(batch_loss=f"{loss.item():.4f}")
     return total_loss / len(loader.dataset)
 
 
@@ -34,8 +40,8 @@ def evaluate_emotion(model, loader, criterion, device):
     all_preds, all_targets = [], []
 
     with torch.no_grad():
-        for specs, labels, _ in loader:
-            specs, labels = specs.to(device), labels.to(device)
+        for specs, labels, _ in tqdm(loader, desc="Validating", leave=False):
+            specs, labels = specs.to(device, non_blocking=True), labels.to(device, non_blocking=True)
             outputs = model(specs)
             loss = criterion(outputs, labels)
             total_loss += loss.item() * len(labels)
@@ -58,11 +64,11 @@ def run_emotion_training(
     lr: float = 1e-3,
     use_noise_aug: bool = True,
 ):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = get_device()
     print(f"\n=======================================================")
     print(f" Starting Speech Emotion Recognition (SER) Training")
-    print(f" UrbanSound8K Noise Augmentation: {use_noise_aug}")
-    print(f" Device: {device} | Epochs: {epochs} | Batch: {batch_size}")
+    print(f" Target Device: {device} | UrbanSound8K Noise: {use_noise_aug}")
+    print(f" Epochs: {epochs} | Batch Size: {batch_size}")
     print(f"=======================================================\n")
 
     CHECKPOINTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -79,13 +85,17 @@ def run_emotion_training(
     best_checkpoint = CHECKPOINTS_DIR / "best_emotion_model.pt"
     tracker = RufloExperimentTracker(experiment_name="speech_emotion_recognition_urban_augmented")
 
+    start_total_time = time.time()
     for epoch in range(1, epochs + 1):
-        train_loss = train_emotion_epoch(model, train_loader, criterion, optimizer, device)
+        epoch_start = time.time()
+        train_loss = train_emotion_epoch(model, train_loader, criterion, optimizer, device, epoch, epochs)
         val_loss, val_acc, val_f1, per_class = evaluate_emotion(model, val_loader, criterion, device)
         scheduler.step()
+        epoch_elapsed = time.time() - epoch_start
+        remaining_sec = epoch_elapsed * (epochs - epoch)
 
         print(
-            f"Epoch [{epoch:02d}/{epochs:02d}] "
+            f"Epoch [{epoch:02d}/{epochs:02d}] ({epoch_elapsed:.1f}s, ETA: ~{remaining_sec/60:.1f}m) | "
             f"Train Loss: {train_loss:.4f} | "
             f"Val Loss: {val_loss:.4f} | "
             f"Val Acc: {val_acc:.4f} | "

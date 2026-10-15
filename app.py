@@ -55,6 +55,14 @@ def get_analyzer():
 
 analyzer = get_analyzer()
 
+# Sidebar: Hardware Engine Info
+if torch.cuda.is_available():
+    gpu_name = torch.cuda.get_device_name(0)
+    vram = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+    st.sidebar.success(f"🟢 **Hardware:** {gpu_name} ({vram:.1f} GB)")
+else:
+    st.sidebar.warning("⚠️ **Hardware:** CPU Mode")
+
 # Sidebar: Input Selection
 st.sidebar.header("📁 Audio Input Source")
 input_mode = st.sidebar.radio("Choose Input Mode", ["Curated Dataset Samples", "Upload Custom WAV"])

@@ -18,33 +18,36 @@ from pipeline.emotion_model import EmotionClassifierCNN
 from pipeline.emotion_dataset import EMOTIONS
 from pipeline.speaker_id import SpeakerEmbeddingNet, SpeakerIdentifier
 from pipeline.diarization import SpeakerDiarizer
+from pipeline.device import get_device
 from pipeline.ruflo_tracker import RufloExperimentTracker
 
 
 class UnifiedAudioAnalyzer:
     """Multi-task audio processing pipeline combining UrbanSound, Speaker ID, Emotion & Diarization."""
 
-    def __init__(self):
+    def __init__(self, device: torch.device = None):
+        self.device = device if device is not None else get_device()
+
         # 1. Environmental Audio Classifier (UrbanSound8K)
-        self.urban_model = AudioCNN()
+        self.urban_model = AudioCNN().to(self.device)
         chk = list(CHECKPOINTS_DIR.glob("best_model_fold*.pt"))
         if chk:
-            state = torch.load(chk[0], map_location="cpu")
+            state = torch.load(chk[0], map_location=self.device)
             self.urban_model.load_state_dict(state["model_state"])
         self.urban_model.eval()
 
         # 2. Emotion Classifier (RAVDESS)
-        self.emotion_model = EmotionClassifierCNN()
+        self.emotion_model = EmotionClassifierCNN().to(self.device)
         emo_chk = CHECKPOINTS_DIR / "best_emotion_model.pt"
         if emo_chk.exists():
-            emo_state = torch.load(emo_chk, map_location="cpu")
+            emo_state = torch.load(emo_chk, map_location=self.device)
             self.emotion_model.load_state_dict(emo_state["model_state"])
         self.emotion_model.eval()
 
         # 3. Speaker ID & Diarizer
-        self.speaker_net = SpeakerEmbeddingNet()
+        self.speaker_net = SpeakerEmbeddingNet().to(self.device)
         self.speaker_net.eval()
-        self.speaker_identifier = SpeakerIdentifier(model=self.speaker_net)
+        self.speaker_identifier = SpeakerIdentifier(model=self.speaker_net, device=self.device)
         self.diarizer = SpeakerDiarizer(embedding_net=self.speaker_net)
 
         # 4. Ruflo Tracker
@@ -63,10 +66,10 @@ class UnifiedAudioAnalyzer:
 
         # Step 1: Detect Environmental Acoustic Background (UrbanSound8K)
         spec = compute_log_mel_spectrogram(waveform)
-        spec_tensor = torch.from_numpy(spec).unsqueeze(0).unsqueeze(0).float()
+        spec_tensor = torch.from_numpy(spec).unsqueeze(0).unsqueeze(0).float().to(self.device)
         with torch.no_grad():
             urban_logits = self.urban_model(spec_tensor)
-            urban_probs = torch.softmax(urban_logits, dim=-1)[0].numpy()
+            urban_probs = torch.softmax(urban_logits, dim=-1)[0].cpu().numpy()
             top_urban_idx = int(np.argmax(urban_probs))
             env_scene = ID_TO_CLASS[top_urban_idx]
             env_conf = float(urban_probs[top_urban_idx])
@@ -87,10 +90,10 @@ class UnifiedAudioAnalyzer:
 
             # Emotion prediction
             seg_spec = compute_log_mel_spectrogram(seg_wave)
-            seg_tensor = torch.from_numpy(seg_spec).unsqueeze(0).unsqueeze(0).float()
+            seg_tensor = torch.from_numpy(seg_spec).unsqueeze(0).unsqueeze(0).float().to(self.device)
             with torch.no_grad():
                 emo_logits = self.emotion_model(seg_tensor)
-                emo_probs = torch.softmax(emo_logits, dim=-1)[0].numpy()
+                emo_probs = torch.softmax(emo_logits, dim=-1)[0].cpu().numpy()
                 top_emo_idx = int(np.argmax(emo_probs))
                 emotion_label = EMOTIONS[top_emo_idx]
                 emotion_conf = float(emo_probs[top_emo_idx])

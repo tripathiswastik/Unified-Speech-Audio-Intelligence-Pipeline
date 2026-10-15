@@ -61,18 +61,23 @@ class SpeakerEmbeddingNet(nn.Module):
         return F.normalize(embedding, p=2, dim=-1)
 
 
+from pipeline.device import get_device
+
+
 class SpeakerIdentifier:
     """Enrolls voiceprints and identifies speakers based on cosine similarity."""
 
-    def __init__(self, model: Optional[SpeakerEmbeddingNet] = None):
+    def __init__(self, model: Optional[SpeakerEmbeddingNet] = None, device: Optional[torch.device] = None):
+        self.device = device if device is not None else get_device(verbose=False)
         self.model = model if model is not None else SpeakerEmbeddingNet()
+        self.model.to(self.device)
         self.model.eval()
         self.enrolled_profiles: Dict[str, np.ndarray] = {}
 
     def extract_embedding(self, waveform: np.ndarray) -> np.ndarray:
         """Extract a 128-dimensional L2-normalized speaker embedding."""
         spec = compute_log_mel_spectrogram(waveform)
-        spec_tensor = torch.from_numpy(spec).unsqueeze(0).unsqueeze(0).float()
+        spec_tensor = torch.from_numpy(spec).unsqueeze(0).unsqueeze(0).float().to(self.device)
         with torch.no_grad():
             emb = self.model(spec_tensor)[0].cpu().numpy()
         return emb

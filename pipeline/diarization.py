@@ -78,11 +78,18 @@ class SpeakerDiarizer:
         n_clusters = min(num_speakers, len(X))
 
         if n_clusters > 1:
-            clustering = AgglomerativeClustering(
-                n_clusters=n_clusters,
-                metric="cosine",
-                linkage="average",
-            )
+            try:
+                clustering = AgglomerativeClustering(
+                    n_clusters=n_clusters,
+                    metric="cosine",
+                    linkage="average",
+                )
+            except TypeError:
+                clustering = AgglomerativeClustering(
+                    n_clusters=n_clusters,
+                    affinity="cosine",
+                    linkage="average",
+                )
             labels = clustering.fit_predict(X)
         else:
             labels = [0] * len(X)

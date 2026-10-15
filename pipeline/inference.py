@@ -22,19 +22,22 @@ def predict_audio(audio_path: str, checkpoint_path: str = None, top_k: int = 3):
     else:
         checkpoint_path = Path(checkpoint_path)
 
+    from pipeline.device import get_device
+    device = get_device()
+
     print(f"Loading checkpoint: {checkpoint_path.name}")
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
-    model = AudioCNN()
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    model = AudioCNN().to(device)
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
 
     waveform = load_and_preprocess_audio(audio_path)
     spec = compute_log_mel_spectrogram(waveform)
-    spec_tensor = torch.from_numpy(spec).unsqueeze(0).unsqueeze(0).float()
+    spec_tensor = torch.from_numpy(spec).unsqueeze(0).unsqueeze(0).float().to(device)
 
     with torch.no_grad():
         logits = model(spec_tensor)
-        probs = torch.softmax(logits, dim=-1)[0].numpy()
+        probs = torch.softmax(logits, dim=-1)[0].cpu().numpy()
 
     top_indices = np.argsort(probs)[::-1][:top_k]
     results = [
