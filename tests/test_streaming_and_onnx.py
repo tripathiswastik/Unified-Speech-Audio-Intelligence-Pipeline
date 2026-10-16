@@ -108,6 +108,11 @@ class TestONNXExportAndEdgeProfiles:
         audio_onnx = CHECKPOINTS_DIR / "se_audiocnn.onnx"
         spk_onnx = CHECKPOINTS_DIR / "se_speaker_embedding.onnx"
 
+        if not audio_onnx.exists():
+            export_se_audiocnn_to_onnx(audio_onnx)
+        if not spk_onnx.exists():
+            export_se_speaker_embedding_to_onnx(spk_onnx)
+
         assert audio_onnx.exists(), f"Missing ONNX file: {audio_onnx}"
         assert spk_onnx.exists(), f"Missing ONNX file: {spk_onnx}"
         assert audio_onnx.stat().st_size > 1_000_000, "SEAudioCNN ONNX size too small"

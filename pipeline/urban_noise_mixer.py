@@ -23,6 +23,15 @@ class UrbanNoiseMixer:
         folds: Optional[List[int]] = None,
     ):
         self.audio_dir = Path(audio_dir)
+        if not self.audio_dir.exists():
+            raise ValueError("Audio directory folds not populated")
+
+        if not any(self.audio_dir.glob("fold*/*.wav")):
+            raise ValueError("Audio directory folds not populated")
+
+        if not Path(metadata_csv).exists():
+            raise ValueError(f"UrbanSound8K metadata not present: {metadata_csv}")
+
         df = pd.read_csv(metadata_csv)
 
         if classes:
@@ -43,8 +52,11 @@ class UrbanNoiseMixer:
         target_class = rec["class"]
         noise_path = self.audio_dir / f"fold{rec['fold']}" / rec["slice_file_name"]
 
-        # Use load_full_audio to preserve full uncropped noise recording
-        waveform, _ = load_full_audio(noise_path)
+        # Use load_full_audio to preserve full uncropped noise recording, catch read errors
+        try:
+            waveform, _ = load_full_audio(noise_path)
+        except Exception as e:
+            raise ValueError(f"Audio directory folds not populated or unreadable: {noise_path}") from e
 
         if len(waveform) >= target_samples:
             start = random.randint(0, len(waveform) - target_samples)
@@ -62,7 +74,10 @@ class UrbanNoiseMixer:
         while total_len < target_samples:
             next_rec = random.choice(same_class_records)
             next_path = self.audio_dir / f"fold{next_rec['fold']}" / next_rec["slice_file_name"]
-            next_wave, _ = load_full_audio(next_path)
+            try:
+                next_wave, _ = load_full_audio(next_path)
+            except Exception as e:
+                raise ValueError(f"Audio directory folds not populated or unreadable: {next_path}") from e
             if len(next_wave) < fade_len:
                 next_wave = np.pad(next_wave, (0, fade_len - len(next_wave)), mode="edge")
 

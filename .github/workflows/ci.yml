@@ -38,6 +38,10 @@ jobs:
       run: |
         python -m pipeline.validate_environment
 
+    - name: Export Edge ONNX Models
+      run: |
+        python -m pipeline.export_onnx
+
     - name: Run Synthetic Unit Tests (CPU Mode)
       env:
         PYTHONPATH: ${{ github.workspace }}
