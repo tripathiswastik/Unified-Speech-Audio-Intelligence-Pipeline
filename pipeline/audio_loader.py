@@ -2,7 +2,7 @@
 Handles 24-bit PCM, WAVE_FORMAT_EXTENSIBLE, multi-channel, and variable sample rates.
 """
 from pathlib import Path
-from typing import Tuple
+from typing import Tuple, Dict
 import numpy as np
 import soundfile as sf
 import librosa
@@ -57,6 +57,17 @@ def load_and_preprocess_audio(file_path: Path, target_sr: int = SAMPLE_RATE) -> 
     return waveform.astype(np.float32)
 
 
+_MEL_BASIS_CACHE: Dict[Tuple[int, int, int], np.ndarray] = {}
+
+
+def get_mel_filterbank(sr: int = SAMPLE_RATE, n_fft: int = N_FFT, n_mels: int = N_MELS) -> np.ndarray:
+    """Retrieve or precompute cached Mel filterbank basis to avoid per-call reallocations."""
+    key = (sr, n_fft, n_mels)
+    if key not in _MEL_BASIS_CACHE:
+        _MEL_BASIS_CACHE[key] = librosa.filters.mel(sr=sr, n_fft=n_fft, n_mels=n_mels)
+    return _MEL_BASIS_CACHE[key]
+
+
 def compute_log_mel_spectrogram(
     waveform: np.ndarray,
     sr: int = SAMPLE_RATE,
@@ -64,15 +75,11 @@ def compute_log_mel_spectrogram(
     n_fft: int = N_FFT,
     hop_length: int = HOP_LENGTH,
 ) -> np.ndarray:
-    """Convert standardized waveform to a normalized Log-Mel Spectrogram."""
-    mel_spec = librosa.feature.melspectrogram(
-        y=waveform,
-        sr=sr,
-        n_mels=n_mels,
-        n_fft=n_fft,
-        hop_length=hop_length,
-        power=2.0,
-    )
+    """Convert standardized waveform to a normalized Log-Mel Spectrogram using precomputed filterbanks."""
+    mel_basis = get_mel_filterbank(sr=sr, n_fft=n_fft, n_mels=n_mels)
+    stft = librosa.stft(waveform, n_fft=n_fft, hop_length=hop_length)
+    power_spec = np.abs(stft) ** 2
+    mel_spec = np.dot(mel_basis, power_spec)
     # Convert to power-to-db (Log-Mel)
     log_mel = librosa.power_to_db(mel_spec, ref=np.max)
 

@@ -1,7 +1,7 @@
 """Speaker Diarization Engine.
 Partitions continuous multi-speaker audio into 'Who spoke when' temporal turns using Agglomerative Clustering.
 """
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 import numpy as np
 import soundfile as sf
 from sklearn.cluster import AgglomerativeClustering
@@ -27,16 +27,18 @@ class DiarizationSegment:
 
 
 class SpeakerDiarizer:
-    """Sliding-window diarizer with energy-based VAD and Agglomerative Clustering."""
+    """Sliding-window diarizer with energy-based VAD, batched neural embeddings, and fast clustering."""
 
     def __init__(
         self,
-        embedding_net: SpeakerEmbeddingNet = None,
+        embedding_net: Optional[SpeakerEmbeddingNet] = None,
         window_size_sec: float = 1.5,
         hop_size_sec: float = 0.5,
         vad_energy_threshold: float = 0.015,
+        device: Optional[Any] = None,
     ):
-        self.identifier = SpeakerIdentifier(model=embedding_net)
+        self.device = device
+        self.identifier = SpeakerIdentifier(model=embedding_net, device=self.device)
         self.window_size = int(window_size_sec * SAMPLE_RATE)
         self.hop_size = int(hop_size_sec * SAMPLE_RATE)
         self.window_sec = window_size_sec
@@ -46,12 +48,12 @@ class SpeakerDiarizer:
     def diarize(
         self, waveform: np.ndarray, num_speakers: int = 2
     ) -> List[DiarizationSegment]:
-        """Perform speaker diarization on a continuous waveform."""
+        """Perform speaker diarization on a continuous waveform using batched inference."""
         total_samples = len(waveform)
         if total_samples < self.window_size:
             return []
 
-        window_embeddings = []
+        valid_windows = []
         window_meta = []
 
         # 1. Sliding Window & VAD Extraction
@@ -64,18 +66,24 @@ class SpeakerDiarizer:
             if rms < self.vad_thresh:
                 continue  # Skip silent / low-energy segment
 
-            emb = self.identifier.extract_embedding(window)
-            window_embeddings.append(emb)
             start_t = start_idx / SAMPLE_RATE
             end_t = end_idx / SAMPLE_RATE
-            window_meta.append((start_t, end_t, emb))
+            valid_windows.append(window)
+            window_meta.append((start_t, end_t))
 
-        if not window_embeddings:
+        if not valid_windows:
             return []
 
-        # 2. Agglomerative Clustering on Cosine Distance
-        X = np.array(window_embeddings)
+        # 2. Batched Neural Embedding Forward Pass (High-Throughput)
+        X = self.identifier.extract_batch_embeddings(valid_windows, batch_size=32)
         n_clusters = min(num_speakers, len(X))
+
+        # Optional dimensionality reduction for long audio (> 50 windows) to accelerate clustering
+        X_clust = X
+        if len(X) > 50 and X.shape[1] > 16:
+            from sklearn.decomposition import TruncatedSVD
+            svd = TruncatedSVD(n_components=16, random_state=42)
+            X_clust = svd.fit_transform(X)
 
         if n_clusters > 1:
             try:
@@ -90,15 +98,15 @@ class SpeakerDiarizer:
                     linkage="average",
                     **{"affinity": "cosine"},
                 )
-            labels = clustering.fit_predict(X)
+            labels = clustering.fit_predict(X_clust)
         else:
             labels = [0] * len(X)
 
         # 3. Assemble and Merge Consecutive Windows of the Same Speaker
         raw_segments = []
-        for i, (st, et, emb) in enumerate(window_meta):
+        for i, (st, et) in enumerate(window_meta):
             spk_label = f"Speaker_{labels[i]}"
-            raw_segments.append(DiarizationSegment(st, et, spk_label, emb))
+            raw_segments.append(DiarizationSegment(st, et, spk_label, X[i]))
 
         merged_segments = []
         current = raw_segments[0]

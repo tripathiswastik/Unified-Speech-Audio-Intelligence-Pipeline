@@ -23,9 +23,13 @@ from pipeline.device import get_device
 from pipeline.ruflo_tracker import RufloExperimentTracker
 
 
+from collections import OrderedDict
+
+
 class VoxCelebDataset(Dataset):
-    """Dataset for VoxCeleb audio files with in-memory spectrogram caching."""
-    _CACHE: Dict[str, np.ndarray] = {}
+    """Dataset for VoxCeleb audio files with bounded LRU spectrogram caching."""
+    _CACHE_LRU: OrderedDict[str, np.ndarray] = OrderedDict()
+    _MAX_CACHE_SIZE: int = 3000
 
     def __init__(self, file_paths: List[Path], labels: List[int], augment: bool = False):
         self.file_paths = file_paths
@@ -39,12 +43,15 @@ class VoxCelebDataset(Dataset):
     def __getitem__(self, index: int) -> Tuple[torch.Tensor, int]:
         fp = self.file_paths[index]
         key = str(fp)
-        if key in self._CACHE:
-            spec = self._CACHE[key]
+        if key in self._CACHE_LRU:
+            spec = self._CACHE_LRU[key]
+            self._CACHE_LRU.move_to_end(key)
         else:
             waveform = load_and_preprocess_audio(fp)
             spec = compute_log_mel_spectrogram(waveform)
-            self._CACHE[key] = spec
+            if len(self._CACHE_LRU) >= self._MAX_CACHE_SIZE:
+                self._CACHE_LRU.popitem(last=False)
+            self._CACHE_LRU[key] = spec
 
         if self.augment and self.spec_augment is not None:
             spec = self.spec_augment(spec.copy())

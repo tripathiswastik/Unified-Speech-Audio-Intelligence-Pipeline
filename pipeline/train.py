@@ -73,15 +73,21 @@ def run_training(
     epochs: int = DEFAULT_EPOCHS,
     batch_size: int = BATCH_SIZE,
     lr: float = LEARNING_RATE,
+    num_workers: int = 0,
 ):
     device = get_device()
     print(f"\n=======================================================")
     print(f" Starting UrbanSound8K Training | Test Fold: {test_fold}")
-    print(f" Target Device: {device} | Epochs: {epochs} | Batch: {batch_size}")
+    print(f" Target Device: {device} | Epochs: {epochs} | Batch: {batch_size} | Workers: {num_workers}")
     print(f"=======================================================\n")
 
     CHECKPOINTS_DIR.mkdir(parents=True, exist_ok=True)
-    train_loader, val_loader = get_dataloaders(test_fold=test_fold, batch_size=batch_size)
+    train_loader, val_loader = get_dataloaders(
+        test_fold=test_fold,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        pin_memory=(device.type == "cuda"),
+    )
 
     model = AudioCNN().to(device)
     criterion = nn.CrossEntropyLoss()

@@ -70,9 +70,25 @@ class SpeakerIdentifier:
     def __init__(self, model: Optional[SpeakerEmbeddingNet] = None, device: Optional[torch.device] = None):
         self.device = device if device is not None else get_device(verbose=False)
         self.model = model if model is not None else SpeakerEmbeddingNet()
-        self.model.to(self.device)
+        try:
+            param = next(self.model.parameters())
+            if param.device != self.device:
+                self.model.to(self.device)
+        except StopIteration:
+            self.model.to(self.device)
         self.model.eval()
         self.enrolled_profiles: Dict[str, np.ndarray] = {}
+        self._enrolled_matrix: Optional[np.ndarray] = None
+        self._enrolled_names: List[str] = []
+
+    def _update_enrolled_matrix(self):
+        """Build a cached 2D matrix of enrolled voiceprints for fast vectorized search."""
+        if not self.enrolled_profiles:
+            self._enrolled_matrix = None
+            self._enrolled_names = []
+            return
+        self._enrolled_names = list(self.enrolled_profiles.keys())
+        self._enrolled_matrix = np.stack([self.enrolled_profiles[name] for name in self._enrolled_names], axis=0)
 
     def extract_embedding(self, waveform: np.ndarray) -> np.ndarray:
         """Extract a 128-dimensional L2-normalized speaker embedding."""
@@ -82,32 +98,49 @@ class SpeakerIdentifier:
             emb = self.model(spec_tensor)[0].cpu().numpy()
         return emb
 
+    def extract_batch_embeddings(self, waveforms: List[np.ndarray], batch_size: int = 32) -> np.ndarray:
+        """Extract embeddings for multiple audio windows in batched forward passes."""
+        if not waveforms:
+            return np.empty((0, 128), dtype=np.float32)
+
+        # Precompute spectrograms
+        specs = [compute_log_mel_spectrogram(w) for w in waveforms]
+        all_embeddings = []
+
+        with torch.no_grad():
+            for i in range(0, len(specs), batch_size):
+                chunk = specs[i : i + batch_size]
+                # Stack into (B, 1, n_mels, time_steps)
+                batch_tensor = torch.from_numpy(np.stack(chunk, axis=0)).unsqueeze(1).float().to(self.device)
+                chunk_embs = self.model(batch_tensor).cpu().numpy()
+                all_embeddings.append(chunk_embs)
+
+        return np.concatenate(all_embeddings, axis=0)
+
     def enroll(self, speaker_name: str, audio_path: Path):
         """Enroll a speaker voiceprint into the identification registry."""
         waveform = load_and_preprocess_audio(audio_path)
         emb = self.extract_embedding(waveform)
         if speaker_name in self.enrolled_profiles:
-            # Running average of voiceprint embeddings
-            self.enrolled_profiles[speaker_name] = F.normalize(
-                torch.from_numpy(self.enrolled_profiles[speaker_name] + emb), p=2, dim=0
-            ).numpy()
+            # Running average of voiceprint embeddings using direct NumPy normalization
+            combined = self.enrolled_profiles[speaker_name] + emb
+            norm = np.linalg.norm(combined)
+            self.enrolled_profiles[speaker_name] = (combined / max(norm, 1e-12)).astype(np.float32)
         else:
-            self.enrolled_profiles[speaker_name] = emb
+            self.enrolled_profiles[speaker_name] = emb.astype(np.float32)
+        self._update_enrolled_matrix()
 
     def identify(self, waveform: np.ndarray, threshold: float = 0.5) -> Tuple[str, float]:
-        """Identify which enrolled speaker matches the waveform."""
-        if not self.enrolled_profiles:
+        """Identify which enrolled speaker matches the waveform using vectorized matrix search."""
+        if not self.enrolled_profiles or self._enrolled_matrix is None:
             return "Unknown_Speaker", 0.0
 
         query_emb = self.extract_embedding(waveform)
-        best_speaker = "Unknown_Speaker"
-        best_sim = -1.0
-
-        for name, profile_emb in self.enrolled_profiles.items():
-            sim = float(np.dot(query_emb, profile_emb))
-            if sim > best_sim:
-                best_sim = sim
-                best_speaker = name
+        # Vectorized dot product against all enrolled profiles in one operation
+        sims = np.dot(self._enrolled_matrix, query_emb)
+        best_idx = int(np.argmax(sims))
+        best_sim = float(sims[best_idx])
+        best_speaker = self._enrolled_names[best_idx]
 
         if best_sim < threshold:
             return f"Unenrolled ({best_speaker}?)", best_sim

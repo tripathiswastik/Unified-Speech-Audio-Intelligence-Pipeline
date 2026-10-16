@@ -1,8 +1,8 @@
-"""Pipeline Configuration for UrbanSound8K Classification."""
+import os
 from pathlib import Path
 
-# Paths
-BASE_DIR = Path("d:/ag-ai/UrbanSound")
+# Paths (Dynamic cross-platform root with environment variable override)
+BASE_DIR = Path(os.getenv("URBANSOUND_BASE_DIR", str(Path(__file__).resolve().parent.parent)))
 DATASET_DIR = BASE_DIR / "UrbanSound8K"
 AUDIO_DIR = DATASET_DIR / "audio"
 METADATA_CSV = DATASET_DIR / "metadata" / "UrbanSound8K.csv"
