@@ -182,8 +182,12 @@ async def analyze_audio(
         try:
             from pipeline.urban_noise_mixer import UrbanNoiseMixer
             mixer = UrbanNoiseMixer(classes=[noise_class])
-            waveform, chosen_class, achieved_snr = mixer.mix(waveform, snr_db=snr_db)
+            waveform, chosen_class, achieved_snr = mixer.mix(waveform, snr_db=snr_db, noise_class=noise_class)
+        except ValueError as val_err:
+            logger.warning("Noise injection invalid input: %s", val_err)
+            raise HTTPException(status_code=400, detail=f"Urban noise mixing parameter error: {str(val_err)}")
         except Exception as mix_err:
+            logger.exception("Unexpected error during noise injection: %s", mix_err)
             raise HTTPException(status_code=500, detail=f"Urban noise mixing failed: {str(mix_err)}")
 
     # 4. Run unified analysis
