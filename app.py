@@ -250,7 +250,8 @@ with tab_speaker_studio:
             for name, emb in enrolled.items():
                 with st.expander(f"👤 **{name}** (128-d Vector)", expanded=False):
                     st.caption(f"Norm: {np.linalg.norm(emb):.4f} | First 8 dims: `{np.round(emb[:8], 3)}`")
-                    fig_emb, ax_emb = plt.subplots(figsize=(6, 1.2))
+                    fig_emb = plt.figure(figsize=(6, 1.2))
+                    ax_emb = fig_emb.add_subplot(111)
                     ax_emb.bar(range(128), emb, color="#1E88E5", width=0.8)
                     ax_emb.set_xlim(-1, 128)
                     ax_emb.set_ylabel("Value")
@@ -273,7 +274,10 @@ with tab_speaker_studio:
                     f.write(enroll_upload.getbuffer())
                 analyzer.enroll_known_speaker(new_spk_name.strip(), enroll_temp)
                 st.success(f"✅ Successfully enrolled voiceprint for **{new_spk_name.strip()}**!")
-                st.rerun()
+                if hasattr(st, "rerun"):
+                    getattr(st, "rerun")()
+                elif hasattr(st, "experimental_rerun"):
+                    getattr(st, "experimental_rerun")()
             else:
                 st.error("Please provide both a speaker name and an audio file.")
 
@@ -296,9 +300,9 @@ with tab_speaker_studio:
 
         threshold = st.slider("Cosine Verification Threshold", min_value=0.20, max_value=0.90, value=0.60, step=0.05, key="verify_thresh")
 
-        if st.button("🔬 Compute Pairwise Verification", type="primary", key="verify_btn") and vox_files:
-            file_a = vox_files[idx_a]
-            file_b = vox_files[idx_b]
+        if st.button("🔬 Compute Pairwise Verification", type="primary", key="verify_btn") and vox_files and idx_a is not None and idx_b is not None:
+            file_a = vox_files[int(idx_a)]
+            file_b = vox_files[int(idx_b)]
 
             wav_a = load_and_preprocess_audio(file_a)
             wav_b = load_and_preprocess_audio(file_b)
@@ -389,17 +393,20 @@ with tab_metrics:
                     # Table of Folds
                     table_rows = []
                     for r in sorted(urban_runs, key=lambda x: x.get("test_fold", 0)):
+                        val_acc = float(r.get("val_accuracy") or 0.0)
+                        val_f1 = float(r.get("val_macro_f1") or 0.0)
                         table_rows.append({
                             "Fold": f"Fold {r.get('test_fold')}",
                             "Epochs": r.get("epochs"),
-                            "Val Accuracy": f"{r.get('val_accuracy')*100:.2f}%",
-                            "Macro-F1": f"{r.get('val_macro_f1'):.4f}",
-                            "Checkpoint": Path(r.get("checkpoint", "")).name,
+                            "Val Accuracy": f"{val_acc*100:.2f}%",
+                            "Macro-F1": f"{val_f1:.4f}",
+                            "Checkpoint": Path(str(r.get("checkpoint", ""))).name,
                         })
                     st.dataframe(table_rows, use_container_width=True)
 
                     # Bar Chart of Cross-Validation Folds
-                    fig_cv, ax_cv = plt.subplots(figsize=(6, 2.8))
+                    fig_cv = plt.figure(figsize=(6, 2.8))
+                    ax_cv = fig_cv.add_subplot(111)
                     folds_idx = [r.get("test_fold", i+1) for i, r in enumerate(sorted(urban_runs, key=lambda x: x.get("test_fold", 0)))]
                     f1_vals = [r.get("val_macro_f1", 0) for r in sorted(urban_runs, key=lambda x: x.get("test_fold", 0))]
                     ax_cv.bar(folds_idx, f1_vals, color="#1E88E5", alpha=0.85, width=0.6)
@@ -420,7 +427,8 @@ with tab_metrics:
                     v_run = vox_runs[-1]
                     m_v1, m_v2, m_v3 = st.columns(3)
                     with m_v1:
-                        st.metric("Top-1 Accuracy", f"{v_run.get('val_accuracy', 0)*100:.2f}%")
+                        vox_top1 = float(v_run.get('val_accuracy') or 0.0)
+                        st.metric("Top-1 Accuracy", f"{vox_top1*100:.2f}%")
                     with m_v2:
                         st.metric("Top-5 Accuracy", "96.00%")
                     with m_v3:
