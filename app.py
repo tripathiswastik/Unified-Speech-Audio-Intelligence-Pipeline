@@ -97,6 +97,8 @@ if "session_enrolled_speakers" not in st.session_state:
 # Synchronize session enrollments with analyzer's identifier
 if analyzer_ready and analyzer is not None:
     analyzer.speaker_identifier.enrolled_profiles = dict(st.session_state["session_enrolled_speakers"])
+    analyzer.speaker_identifier._update_enrolled_matrix()
+
 
 
 # Sidebar: Hardware Engine Status
