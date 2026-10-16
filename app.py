@@ -390,7 +390,7 @@ with tab_speaker_studio:
         enroll_choice = st.radio("Reference Audio Source", enroll_opts, key="enroll_src_radio")
         enroll_path: Optional[Path] = None
         
-        if enroll_choice.startswith("📁 Use Sidebar Upload"):
+        if enroll_choice and enroll_choice.startswith("📁 Use Sidebar Upload"):
             enroll_path = global_custom_file
             st.caption(f"Using `{global_custom_name}` for voiceprint registration.")
         else:
@@ -441,7 +441,7 @@ with tab_speaker_studio:
             file_a: Optional[Path] = None
             label_a: str = "Sample A"
 
-            if opt_a.startswith("📁 Sidebar Upload"):
+            if opt_a and opt_a.startswith("📁 Sidebar Upload"):
                 file_a = global_custom_file
                 label_a = global_custom_name or "Custom Audio A"
             elif opt_a == "⬆️ Upload Custom WAV":
@@ -465,7 +465,7 @@ with tab_speaker_studio:
             file_b: Optional[Path] = None
             label_b: str = "Sample B"
 
-            if opt_b.startswith("📁 Sidebar Upload"):
+            if opt_b and opt_b.startswith("📁 Sidebar Upload"):
                 file_b = global_custom_file
                 label_b = global_custom_name or "Custom Audio B"
             elif opt_b == "⬆️ Upload Custom WAV":
@@ -800,7 +800,7 @@ with tab_streaming:
 
         stream_audio_path: Optional[Path] = None
         stream_label = "Audio Stream"
-        if sample_choice.startswith("📁 Sidebar Upload"):
+        if sample_choice and sample_choice.startswith("📁 Sidebar Upload"):
             stream_audio_path = global_custom_file
             stream_label = global_custom_name or "Custom Audio"
         elif sample_choice == "⬆️ Upload Custom WAV for Streaming":
@@ -887,13 +887,13 @@ with tab_streaming:
         with art_col1:
             if onnx_audio.exists():
                 sz = onnx_audio.stat().st_size / (1024 * 1024)
-                st.success(f"🟢 **SEAudioCNN**<br>`{onnx_audio.name}` ({sz:.2f} MB)", unsafe_allow_html=True)
+                st.success(f"🟢 **SEAudioCNN** : `{onnx_audio.name}` ({sz:.2f} MB)")
             else:
                 st.warning("⚠️ `se_audiocnn.onnx` missing")
         with art_col2:
             if onnx_spk.exists():
                 sz = onnx_spk.stat().st_size / (1024 * 1024)
-                st.success(f"🟢 **SESpeakerNet**<br>`{onnx_spk.name}` ({sz:.2f} MB)", unsafe_allow_html=True)
+                st.success(f"🟢 **SESpeakerNet** : `{onnx_spk.name}` ({sz:.2f} MB)")
             else:
                 st.warning("⚠️ `se_speaker_embedding.onnx` missing")
 
