@@ -631,6 +631,7 @@ def main():
     parser.add_argument("--max-val-batches", type=int, default=None, help="Cap validation batches per epoch (runs full validation on final epoch)")
     parser.add_argument("--smoke-test", action="store_true", help="Run 2-epoch smoke-training job with checkpoint reload verification")
     parser.add_argument("--export-onnx", action="store_true", default=True, help="Export static ONNX on completion")
+    parser.add_argument("--resume", action="store_true", help="Resume training from latest_multitask_streaming_wavlm.pt if available")
     args = parser.parse_args()
 
     if args.smoke_test:
@@ -724,6 +725,22 @@ def main():
     tracker = RufloExperimentTracker(experiment_name="multitask_streaming_wavlm")
     best_composite = -1.0
     best_ckpt_path = CHECKPOINTS_DIR / "best_multitask_streaming_wavlm.pt"
+    latest_ckpt_path = CHECKPOINTS_DIR / "latest_multitask_streaming_wavlm.pt"
+
+    start_epoch = 1
+    epoch_loss_history = []
+
+    if args.resume and latest_ckpt_path.exists():
+        saved_state = torch.load(latest_ckpt_path, map_location=device)
+        model.load_state_dict(saved_state["model_state"])
+        arc_margin.load_state_dict(saved_state["arc_margin_state"])
+        uncertainty_loss.load_state_dict(saved_state["uncertainty_loss_state"])
+        optimizer.load_state_dict(saved_state["optimizer_state"])
+        scheduler.load_state_dict(saved_state["scheduler_state"])
+        start_epoch = saved_state["epoch"] + 1
+        best_composite = saved_state.get("best_composite", -1.0)
+        epoch_loss_history = saved_state.get("loss_history", [])
+        print(f"[Resume] Restored training state from {latest_ckpt_path.name} (Resuming at Epoch {start_epoch}/{args.epochs}, Best Composite: {best_composite:.4f})")
 
     # Task-Specific Promotion Gates
     GATE_MIN_SCENE_F1 = 0.50
@@ -732,9 +749,7 @@ def main():
 
     t_start = time.time()
 
-    epoch_loss_history = []
-
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
         losses = train_multitask_epoch(
             model=model,
             arc_margin=arc_margin,
@@ -788,6 +803,18 @@ def main():
             torch.save(model.state_dict(), best_ckpt_path)
             gate_status = "PASSED ALL GATES" if passes_gates else "GATES HELD"
             print(f"  [CHECKPOINT SAVED] Composite: {comp:.4f} ({gate_status}) -> {best_ckpt_path.name}")
+
+        # Always save latest checkpoint for crash recovery
+        torch.save({
+            "epoch": epoch,
+            "model_state": model.state_dict(),
+            "arc_margin_state": arc_margin.state_dict(),
+            "uncertainty_loss_state": uncertainty_loss.state_dict(),
+            "optimizer_state": optimizer.state_dict(),
+            "scheduler_state": scheduler.state_dict(),
+            "best_composite": best_composite,
+            "loss_history": epoch_loss_history,
+        }, latest_ckpt_path)
 
     total_time = time.time() - t_start
     print(f"\n[Causal MultiTask Transformer] Training completed in {total_time/60:.2f} mins. Best Composite: {best_composite:.4f}")

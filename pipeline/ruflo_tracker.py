@@ -54,9 +54,10 @@ class RufloExperimentTracker:
             "hyperparameters": hyperparameters,
             "checkpoint": checkpoint_path,
         }
-        self.history["runs"].append(run_record)
-        with open(self.history_file, "w", encoding="utf-8") as f:
+        temp_file = self.history_file.with_suffix(".tmp")
+        with open(temp_file, "w", encoding="utf-8") as f:
             json.dump(self.history, f, indent=2)
+        temp_file.replace(self.history_file)
         print(f"[Ruflo Tracker] Logged fold {fold} metrics -> Macro F1: {val_macro_f1:.4f}, Accuracy: {val_accuracy:.4f}")
 
     def get_cv_summary(self) -> Dict[str, Any]:
