@@ -46,6 +46,10 @@ class UnifiedAudioAnalyzer:
 
         # 3. Speaker ID & Diarizer
         self.speaker_net = SpeakerEmbeddingNet().to(self.device)
+        spk_chk = CHECKPOINTS_DIR / "best_speaker_model.pt"
+        if spk_chk.exists():
+            spk_state = torch.load(spk_chk, map_location=self.device)
+            self.speaker_net.load_state_dict(spk_state["model_state"])
         self.speaker_net.eval()
         self.speaker_identifier = SpeakerIdentifier(model=self.speaker_net, device=self.device)
         self.diarizer = SpeakerDiarizer(embedding_net=self.speaker_net)
