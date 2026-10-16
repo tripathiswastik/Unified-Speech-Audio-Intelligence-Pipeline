@@ -9,6 +9,7 @@ import io
 import os
 import time
 import base64
+import logging
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
@@ -19,6 +20,9 @@ from fastapi import FastAPI, UploadFile, File, Form, WebSocket, WebSocketDisconn
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
 from pipeline.config import BASE_DIR, CHECKPOINTS_DIR, SAMPLE_RATE, CLASSES
 from pipeline.device import get_device
@@ -65,15 +69,27 @@ def get_analyzer() -> UnifiedAudioAnalyzer:
     if _analyzer is None:
         require_trained = os.getenv("REQUIRE_TRAINED_CHECKPOINTS", "0").strip().lower() in ("1", "true", "yes")
         try:
-            # First attempt strict checkpoint loading
+            # Try strict load first (production behavior)
             _analyzer = UnifiedAudioAnalyzer(strict_checkpoints=True, demo_mode=False)
+            logger.info("Loaded trained checkpoints in strict mode.")
         except Exception as e:
+            # If strictly required, fail loudly
             if require_trained:
+                logger.exception("Trained checkpoints are required but failed to load.")
                 raise RuntimeError(
                     f"Production server refused to serve inference: Trained checkpoints are strictly required: {e}"
-                )
-            logger.warning("Checkpoints missing or incomplete; falling back to explicit demo_mode=True: %s", e)
-            _analyzer = UnifiedAudioAnalyzer(strict_checkpoints=False, demo_mode=True)
+                ) from e
+            # Otherwise fall back to demo/synthetic mode and be explicit about it
+            logger.warning(
+                "Failed to load trained checkpoints (%s). Falling back to demo_mode=True with synthetic checkpoints for CI/testing.",
+                e,
+            )
+            try:
+                _analyzer = UnifiedAudioAnalyzer(strict_checkpoints=False, demo_mode=True)
+                logger.info("Initialized analyzer in demo_mode=True (synthetic checkpoints).")
+            except Exception as e2:
+                logger.exception("Failed to initialize analyzer even in demo mode.")
+                raise
     return _analyzer
 
 

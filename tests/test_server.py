@@ -124,3 +124,39 @@ def test_websocket_streaming_connection(client):
         # Push 0.5s of audio as float32 bytes
         chunk = np.zeros(int(0.5 * SAMPLE_RATE), dtype=np.float32)
         websocket.send_bytes(chunk.tobytes())
+
+
+def test_analyzer_fallback_when_checkpoints_missing(monkeypatch):
+    """Verify that get_analyzer() falls back to demo_mode=True without NameError when checkpoints are missing."""
+    import pipeline.server
+    monkeypatch.setattr(pipeline.server, "_analyzer", None)
+    monkeypatch.setenv("REQUIRE_TRAINED_CHECKPOINTS", "0")
+
+    original_init = pipeline.server.UnifiedAudioAnalyzer.__init__
+
+    def mock_init(self, strict_checkpoints=True, demo_mode=False, **kwargs):
+        if strict_checkpoints and not demo_mode:
+            raise FileNotFoundError("Mock missing checkpoints")
+        original_init(self, strict_checkpoints=False, demo_mode=True, **kwargs)
+
+    monkeypatch.setattr(pipeline.server.UnifiedAudioAnalyzer, "__init__", mock_init)
+
+    ana = pipeline.server.get_analyzer()
+    assert ana is not None
+    assert ana.demo_mode is True
+
+
+def test_analyzer_strict_mode_enforcement(monkeypatch):
+    """Verify that get_analyzer() raises RuntimeError if REQUIRE_TRAINED_CHECKPOINTS=1 and checkpoints fail."""
+    import pipeline.server
+    monkeypatch.setattr(pipeline.server, "_analyzer", None)
+    monkeypatch.setenv("REQUIRE_TRAINED_CHECKPOINTS", "1")
+
+    def mock_init(self, strict_checkpoints=True, demo_mode=False, **kwargs):
+        raise FileNotFoundError("Mock missing checkpoints")
+
+    monkeypatch.setattr(pipeline.server.UnifiedAudioAnalyzer, "__init__", mock_init)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        pipeline.server.get_analyzer()
+    assert "Trained checkpoints are strictly required" in str(exc_info.value)
