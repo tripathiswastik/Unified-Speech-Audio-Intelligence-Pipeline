@@ -301,8 +301,8 @@ with tab_speaker_studio:
         threshold = st.slider("Cosine Verification Threshold", min_value=0.20, max_value=0.90, value=0.60, step=0.05, key="verify_thresh")
 
         if st.button("🔬 Compute Pairwise Verification", type="primary", key="verify_btn") and vox_files and idx_a is not None and idx_b is not None:
-            file_a = vox_files[int(idx_a)]
-            file_b = vox_files[int(idx_b)]
+            file_a = vox_files[idx_a]
+            file_b = vox_files[idx_b]
 
             wav_a = load_and_preprocess_audio(file_a)
             wav_b = load_and_preprocess_audio(file_b)
