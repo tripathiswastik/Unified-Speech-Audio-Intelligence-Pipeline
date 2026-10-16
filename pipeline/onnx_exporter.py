@@ -2,6 +2,7 @@
 Exports audio classifier and speaker embedding models to ONNX format with strict checkpoint provenance,
 operator compatibility verification, dynamic shape support, and numerical equivalence validation.
 """
+import os
 from pathlib import Path
 from typing import Dict, Any, Tuple, Optional
 import hashlib
@@ -350,15 +351,25 @@ def profile_edge_frontends(num_runs: int = 20) -> Dict[str, Any]:
     return profiles
 
 
-def run_edge_preparation():
-    """Execute complete edge export and operator compatibility pipeline."""
+def run_edge_preparation(strict_checkpoints: Optional[bool] = None) -> Dict[str, Any]:
+    """Execute complete edge export and operator compatibility pipeline.
+    
+    Args:
+        strict_checkpoints: If True, strictly requires verified trained checkpoints.
+            If False, permits untrained random weights for testing/CI.
+            If None (default), reads from ALLOW_UNTRAINED_ONNX environment variable.
+    """
+    if strict_checkpoints is None:
+        allow_untrained = os.getenv("ALLOW_UNTRAINED_ONNX", "0").strip().lower() in ("1", "true", "yes")
+        strict_checkpoints = not allow_untrained
+
     print("\n" + "=" * 65)
-    print(" Executing ONNX Edge Export & Operator Compatibility Validation")
+    print(f" Executing ONNX Edge Export (Strict Checkpoints: {strict_checkpoints})")
     print("=" * 65 + "\n")
 
-    # Export models to ONNX strictly requiring trained checkpoints
-    onnx_audio = export_se_audiocnn_to_onnx(strict_checkpoints=True)
-    onnx_spk = export_se_speaker_embedding_to_onnx(strict_checkpoints=True)
+    # Export models to ONNX
+    onnx_audio = export_se_audiocnn_to_onnx(strict_checkpoints=strict_checkpoints)
+    onnx_spk = export_se_speaker_embedding_to_onnx(strict_checkpoints=strict_checkpoints)
 
     print("\n[Compatibility Check] Operators Verified:")
     print("  [OK] Depthwise Separable Convolutions: mapped to ONNX Conv with group parameter")

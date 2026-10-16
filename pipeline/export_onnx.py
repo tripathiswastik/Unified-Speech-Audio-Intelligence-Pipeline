@@ -16,7 +16,8 @@ def main():
 
     try:
         from pipeline.onnx_exporter import run_edge_preparation
-        res = run_edge_preparation()
+        allow_untrained = os.getenv("ALLOW_UNTRAINED_ONNX", "0").strip().lower() in ("1", "true", "yes")
+        res = run_edge_preparation(strict_checkpoints=not allow_untrained)
         print("\n[SUCCESS] Edge models exported successfully.")
         return res
     except Exception as exc:

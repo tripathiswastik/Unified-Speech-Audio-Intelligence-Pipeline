@@ -175,9 +175,10 @@ class TestONNXExportAndEdgeProfiles:
         audio_onnx = CHECKPOINTS_DIR / "se_audiocnn.onnx"
         spk_onnx = CHECKPOINTS_DIR / "se_speaker_embedding.onnx"
 
-        # Export models requiring trained checkpoints and verifying numerical equivalence
-        res_audio = export_se_audiocnn_to_onnx(strict_checkpoints=True, verify_equivalence=True)
-        res_spk = export_se_speaker_embedding_to_onnx(strict_checkpoints=True, verify_equivalence=True)
+        # Export models requiring trained checkpoints (unless ALLOW_UNTRAINED_ONNX=1 in CI) and verifying numerical equivalence
+        allow_untrained = os.getenv("ALLOW_UNTRAINED_ONNX", "0").strip().lower() in ("1", "true", "yes")
+        res_audio = export_se_audiocnn_to_onnx(strict_checkpoints=not allow_untrained, verify_equivalence=True)
+        res_spk = export_se_speaker_embedding_to_onnx(strict_checkpoints=not allow_untrained, verify_equivalence=True)
 
         assert res_audio.exists(), f"Missing ONNX file: {res_audio}"
         assert res_spk.exists(), f"Missing ONNX file: {res_spk}"

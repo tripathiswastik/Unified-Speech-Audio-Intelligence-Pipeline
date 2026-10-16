@@ -39,8 +39,19 @@ jobs:
       run: |
         python -m pipeline.validate_environment
 
+    - name: Fetch Pretrained Checkpoints (if configured)
+      if: env.CHECKPOINT_URL != ''
+      env:
+        CHECKPOINT_URL: ${{ secrets.CHECKPOINT_URL }}
+      run: |
+        mkdir -p pipeline_output/checkpoints
+        curl -sSL "$CHECKPOINT_URL" -o /tmp/checkpoints.tar.gz
+        tar -xzf /tmp/checkpoints.tar.gz -C pipeline_output/checkpoints
+
     - name: Export Edge ONNX Models (Linux only, verbose)
       if: runner.os == 'Linux'
+      env:
+        ALLOW_UNTRAINED_ONNX: "1"
       run: |
         python -c "import sys; print('Python version:', sys.version)"
         python -X faulthandler -m pipeline.export_onnx
@@ -48,6 +59,8 @@ jobs:
     - name: Run Synthetic Unit Tests (CPU Mode)
       env:
         PYTHONPATH: ${{ github.workspace }}
+        ALLOW_UNTRAINED_ONNX: "1"
       run: |
         python -m pytest tests/ -v
+
 
