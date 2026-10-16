@@ -13,7 +13,7 @@ import re
 import json
 import tempfile
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 import streamlit as st
 import numpy as np
 import matplotlib.pyplot as plt
@@ -182,7 +182,7 @@ elif input_mode == "Curated Dataset Samples":
     cat_names = list(curated_catalog.keys())
     if cat_names:
         category = st.sidebar.selectbox("Dataset Category", cat_names, key="pipeline_category")
-        items = curated_catalog.get(category, [])
+        items = curated_catalog.get(category, []) if category is not None else []
         if items:
             idx = st.sidebar.selectbox("Select File", range(len(items)), format_func=lambda i: items[i][0], key="pipeline_file_idx")
             if idx is not None:
@@ -233,13 +233,13 @@ def render_audio_picker(
     if choice == "SampleLib Presets":
         preset_names = list(samplelib_presets.keys())
         p_name = st.selectbox(f"Select {label} Preset", preset_names, key=f"{key_prefix}_preset_select")
-        if p_name:
+        if p_name and p_name in samplelib_presets:
             resolved_path = samplelib_presets[p_name]
             resolved_label = p_name
     elif choice == "Curated Datasets":
         cat_names = list(curated_catalog.keys())
         cat = st.selectbox(f"{label} Category", cat_names, key=f"{key_prefix}_cat_select")
-        items = curated_catalog.get(cat, [])
+        items = curated_catalog.get(cat, []) if cat is not None else []
         if items:
             idx = st.selectbox(
                 f"Select {label} File",
