@@ -13,33 +13,115 @@ from pipeline.config import AUDIO_DIR, METADATA_CSV, SAMPLE_RATE, TARGET_SAMPLES
 from pipeline.audio_loader import load_full_audio, load_and_preprocess_audio
 
 
+SUPPORTED_SYNTHETIC_CLASSES = {
+    "air_conditioner",
+    "car_horn",
+    "children_playing",
+    "dog_bark",
+    "drilling",
+    "engine_idling",
+    "gun_shot",
+    "jackhammer",
+    "siren",
+    "street_music",
+    "white_noise",
+}
+
+
 def generate_synthetic_noise(noise_class: str, num_samples: int, sr: int = SAMPLE_RATE) -> np.ndarray:
-    """Generate deterministic synthetic acoustic noise for testing/CI when audio folds are absent."""
+    """Generate deterministic synthetic acoustic noise for testing/CI when audio folds are absent.
+    
+    Synthesizes physically plausible acoustic signatures for all 10 UrbanSound8K categories.
+    Rejects unsupported noise classes rather than mislabeling arbitrary white noise.
+    """
+    cls = (noise_class or "white_noise").lower().strip()
+    if cls not in SUPPORTED_SYNTHETIC_CLASSES:
+        raise ValueError(
+            f"Unsupported synthetic noise class '{noise_class}'. "
+            f"Supported classes: {sorted(list(SUPPORTED_SYNTHETIC_CLASSES))}."
+        )
+
     duration = num_samples / float(sr)
     t = np.linspace(0, duration, num_samples, endpoint=False, dtype=np.float32)
-    cls = (noise_class or "white_noise").lower()
+    rng = np.random.RandomState(42)
 
     if cls == "siren":
-        # Frequency-modulated acoustic siren (700Hz to 1200Hz modulated at 2Hz)
+        # Frequency-modulated emergency siren (700Hz to 1200Hz modulated at 1.5Hz)
         f_carrier = 800.0 + 350.0 * np.sin(2 * np.pi * 1.5 * t)
         phase = 2 * np.pi * np.cumsum(f_carrier) / sr
         mod = 0.5 * (1.0 + np.sin(2 * np.pi * 2.0 * t))
         noise = 0.6 * np.sin(phase) * mod
-    elif cls in ("engine_idling", "air_conditioner"):
-        # Low frequency rumble + filtered noise
-        low_tone = 0.4 * np.sin(2 * np.pi * 65.0 * t) + 0.2 * np.sin(2 * np.pi * 130.0 * t)
-        rng = np.random.RandomState(42)
-        white = rng.normal(0, 0.2, num_samples).astype(np.float32)
-        noise = low_tone + white
-    elif cls in ("drilling", "jackhammer"):
-        # Pulsed repetitive acoustic impact
-        pulse = (np.sin(2 * np.pi * 15.0 * t) > 0.3).astype(np.float32)
-        carrier = np.sin(2 * np.pi * 450.0 * t) + 0.5 * np.sin(2 * np.pi * 900.0 * t)
-        rng = np.random.RandomState(42)
-        noise = pulse * carrier + rng.normal(0, 0.15, num_samples).astype(np.float32)
+
+    elif cls == "engine_idling":
+        # Low frequency engine rumble + combustion harmonic pulsation
+        low_tone = 0.4 * np.sin(2 * np.pi * 65.0 * t) + 0.25 * np.sin(2 * np.pi * 130.0 * t)
+        flutter = 0.5 * (1.0 + 0.3 * np.sin(2 * np.pi * 12.0 * t))
+        white = rng.normal(0, 0.15, num_samples).astype(np.float32)
+        noise = (low_tone * flutter) + white
+
+    elif cls == "air_conditioner":
+        # Continuous low-frequency broadband motor hum with 120Hz/240Hz fan tones
+        fan_hum = 0.3 * np.sin(2 * np.pi * 120.0 * t) + 0.15 * np.sin(2 * np.pi * 240.0 * t)
+        broadband = rng.normal(0, 0.25, num_samples).astype(np.float32)
+        noise = fan_hum + broadband
+
+    elif cls == "car_horn":
+        # Two-tone automotive dual-horn chord (F4 349Hz + A4 440Hz)
+        horn = 0.45 * np.sin(2 * np.pi * 349.0 * t) + 0.45 * np.sin(2 * np.pi * 440.0 * t)
+        horn += 0.2 * np.sin(2 * np.pi * 880.0 * t)
+        # 1-second honk pulses with pauses
+        gate = (np.sin(2 * np.pi * 0.8 * t) > -0.2).astype(np.float32)
+        noise = horn * gate
+
+    elif cls == "drilling":
+        # Rapid rotational mechanical friction impact
+        impact_train = (np.sin(2 * np.pi * 30.0 * t) > 0.1).astype(np.float32)
+        whine = 0.4 * np.sin(2 * np.pi * 1200.0 * t) + 0.25 * np.sin(2 * np.pi * 2400.0 * t)
+        hiss = rng.normal(0, 0.2, num_samples).astype(np.float32)
+        noise = (impact_train * whine) + hiss
+
+    elif cls == "jackhammer":
+        # Heavy pneumatic percussive piston strikes at ~10 Hz with resonant ring-down
+        strike_rate = 10.0
+        strike_phase = (t * strike_rate) % 1.0
+        strike_env = np.exp(-strike_phase * 15.0).astype(np.float32)
+        strike_body = np.sin(2 * np.pi * 95.0 * t) + 0.4 * np.sin(2 * np.pi * 190.0 * t)
+        clang = rng.normal(0, 0.2, num_samples).astype(np.float32)
+        noise = (strike_env * strike_body) + (strike_env * clang * 0.5)
+
+    elif cls == "gun_shot":
+        # Explosive acoustic transient with sharp rise and rapid exponential decay
+        shot_rate = 1.0
+        shot_phase = (t * shot_rate) % 1.0
+        decay = np.exp(-shot_phase * 25.0).astype(np.float32)
+        blast = rng.normal(0, 0.8, num_samples).astype(np.float32) + 0.5 * np.sin(2 * np.pi * 80.0 * t)
+        noise = decay * blast
+
+    elif cls == "dog_bark":
+        # Modulated downward chirp burst repeated at intervals
+        bark_rate = 1.2
+        bark_phase = (t * bark_rate) % 1.0
+        bark_gate = (bark_phase < 0.25).astype(np.float32)
+        chirp_f = 450.0 - 200.0 * (bark_phase / 0.25)
+        chirp_phase = 2 * np.pi * np.cumsum(np.clip(chirp_f, 100.0, 600.0)) / sr
+        noise = bark_gate * (0.6 * np.sin(chirp_phase) + rng.normal(0, 0.15, num_samples).astype(np.float32))
+
+    elif cls == "children_playing":
+        # Formant-like multi-harmonic babble and laughter bursts
+        vocal1 = 0.3 * np.sin(2 * np.pi * 320.0 * t) * (0.5 + 0.5 * np.sin(2 * np.pi * 3.5 * t))
+        vocal2 = 0.2 * np.sin(2 * np.pi * 640.0 * t) * (0.5 + 0.5 * np.cos(2 * np.pi * 2.8 * t))
+        vocal3 = 0.15 * np.sin(2 * np.pi * 1280.0 * t)
+        breath = rng.normal(0, 0.1, num_samples).astype(np.float32)
+        noise = vocal1 + vocal2 + vocal3 + breath
+
+    elif cls == "street_music":
+        # Harmonic musical chord progression (C-major / G-major tones) with tempo rhythm
+        chord1 = 0.3 * np.sin(2 * np.pi * 261.63 * t) + 0.25 * np.sin(2 * np.pi * 329.63 * t) + 0.2 * np.sin(2 * np.pi * 392.00 * t)
+        beat = 0.5 * (1.0 + np.sin(2 * np.pi * 2.0 * t))
+        noise = chord1 * beat
+
     else:
-        # Stationary white/pink noise
-        rng = np.random.RandomState(42)
+        # Stationary white noise (only when noise_class="white_noise")
         noise = rng.normal(0.0, 0.3, num_samples).astype(np.float32)
 
     return noise.astype(np.float32)

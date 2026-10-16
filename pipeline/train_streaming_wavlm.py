@@ -41,6 +41,7 @@ from pipeline.config import (
 )
 from pipeline.emotion_dataset import RAVDESS_CSV, RAVDESS_ROOT, EMOTIONS
 from pipeline.streaming_wavlm import (
+    CausalMultiTaskAudioTransformer,
     MultiTaskStreamingWavLM,
     export_streaming_wavlm_to_onnx,
 )
@@ -56,12 +57,22 @@ TOTAL_WINDOW_SAMPLES = TARGET_SR * 1  # 1.0 second (5 chunks)
 
 
 def load_raw_pcm16(file_path: Path, target_samples: int = TOTAL_WINDOW_SAMPLES) -> np.ndarray:
-    """Load audio file as mono 16kHz float32 waveform padded/cropped to target_samples."""
+    """Load audio file as mono 16kHz float32 waveform padded/cropped to target_samples.
+    
+    Rejects missing or corrupted files instead of silently substituting silence.
+    """
+    file_path = Path(file_path)
+    if not file_path.exists():
+        raise FileNotFoundError(f"Audio file does not exist: {file_path}")
+
     file_str = str(file_path)
     try:
         wav, sr = sf.read(file_str, dtype="float32")
-    except Exception:
-        wav, sr = librosa.load(file_str, sr=None, mono=False)
+    except Exception as e:
+        try:
+            wav, sr = librosa.load(file_str, sr=None, mono=False)
+        except Exception as err:
+            raise RuntimeError(f"Corrupted audio file could not be decoded: {file_path}") from err
 
     if wav.ndim > 1:
         wav = np.mean(wav, axis=0 if wav.shape[0] < wav.shape[1] else 1)
@@ -71,6 +82,10 @@ def load_raw_pcm16(file_path: Path, target_samples: int = TOTAL_WINDOW_SAMPLES) 
             wav = librosa.resample(wav, orig_sr=sr, target_sr=TARGET_SR, res_type="soxr_fast")
         except Exception:
             wav = librosa.resample(wav, orig_sr=sr, target_sr=TARGET_SR)
+
+    # Validate finite values
+    if not np.all(np.isfinite(wav)):
+        raise ValueError(f"Audio file contains non-finite values (NaN or Inf): {file_path}")
 
     # Normalize amplitude
     max_val = np.max(np.abs(wav)) if len(wav) > 0 else 0.0
@@ -91,12 +106,43 @@ def load_raw_pcm16(file_path: Path, target_samples: int = TOTAL_WINDOW_SAMPLES) 
 
 
 class UrbanSoundRawDataset(Dataset):
-    """Raw waveform dataset for UrbanSound8K partitioned by official folds."""
+    """Raw waveform dataset for UrbanSound8K partitioned by official folds.
+    
+    Validates physical audio file presence and fails immediately on missing or corrupted assets.
+    """
 
-    def __init__(self, folds: List[int], metadata_csv: Path = METADATA_CSV, audio_dir: Path = AUDIO_DIR):
+    def __init__(
+        self,
+        folds: List[int],
+        metadata_csv: Path = METADATA_CSV,
+        audio_dir: Path = AUDIO_DIR,
+        strict: bool = True,
+    ):
         self.audio_dir = Path(audio_dir)
-        df = pd.read_csv(metadata_csv)
+        self.metadata_csv = Path(metadata_csv)
+        if not self.metadata_csv.exists():
+            raise FileNotFoundError(f"UrbanSound8K metadata not found: {self.metadata_csv}")
+        df = pd.read_csv(self.metadata_csv)
         self.df = df[df["fold"].isin(folds)].reset_index(drop=True)
+
+        if strict:
+            if not self.audio_dir.exists():
+                raise FileNotFoundError(f"UrbanSound8K audio directory not found: {self.audio_dir}")
+            # Verify file presence for folds
+            missing_files = []
+            valid_rows = []
+            for _, row in self.df.iterrows():
+                fp = self.audio_dir / f"fold{row['fold']}" / row["slice_file_name"]
+                if fp.exists():
+                    valid_rows.append(row)
+                else:
+                    missing_files.append(str(fp))
+            if not valid_rows:
+                raise FileNotFoundError(
+                    f"No UrbanSound8K audio files found in {self.audio_dir} for folds {folds}. "
+                    f"Example missing: {missing_files[:3]}"
+                )
+            self.df = pd.DataFrame(valid_rows).reset_index(drop=True)
 
     def __len__(self) -> int:
         return len(self.df)
@@ -104,81 +150,209 @@ class UrbanSoundRawDataset(Dataset):
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
         row = self.df.iloc[idx]
         fp = self.audio_dir / f"fold{row['fold']}" / row["slice_file_name"]
-        try:
-            wav = load_raw_pcm16(fp)
-        except Exception:
-            wav = np.zeros(TOTAL_WINDOW_SAMPLES, dtype=np.float32)
+        wav = load_raw_pcm16(fp)
         label = int(row["classID"])
         return torch.from_numpy(wav), label
 
 
 class VoxCelebRawDataset(Dataset):
-    """Raw waveform dataset for VoxCeleb speaker identification."""
+    """Raw waveform dataset for VoxCeleb speaker identification and open-set verification.
+    
+    Supports speaker-disjoint splitting to rigorously evaluate unseen-speaker open-set verification.
+    """
 
-    def __init__(self, vox_root: Optional[Path] = None, max_speakers: int = 50, split: str = "train"):
+    def __init__(
+        self,
+        vox_root: Optional[Path] = None,
+        max_speakers: int = 50,
+        split: str = "train",
+        speaker_disjoint: bool = True,
+        strict: bool = True,
+    ):
         if vox_root is None:
             vox_root = BASE_DIR / "wav"
         self.vox_root = Path(vox_root)
         self.items: List[Tuple[Path, int]] = []
+        self.speaker_to_id: Dict[str, int] = {}
+        self.speaker_files: Dict[int, List[Path]] = {}
 
-        if self.vox_root.exists():
-            spk_dirs = sorted([d for d in self.vox_root.iterdir() if d.is_dir()])[:max_speakers]
-            self.speaker_to_id = {d.name: idx for idx, d in enumerate(spk_dirs)}
+        if not self.vox_root.exists():
+            if strict:
+                raise FileNotFoundError(
+                    f"VoxCeleb dataset directory not found: {self.vox_root}. "
+                    f"Cannot silently substitute zero waveforms."
+                )
+            return
 
-            all_files: List[Tuple[Path, int]] = []
-            for d in spk_dirs:
-                spk_id = self.speaker_to_id[d.name]
-                for wav_p in sorted(d.glob("*/*.wav")):
-                    all_files.append((wav_p, spk_id))
+        spk_dirs = sorted([d for d in self.vox_root.iterdir() if d.is_dir()])[:max_speakers]
+        if not spk_dirs:
+            if strict:
+                raise FileNotFoundError(f"No speaker directories found under {self.vox_root}")
+            return
 
-            # 80/20 train/val split deterministically
-            np.random.seed(42)
-            indices = np.random.permutation(len(all_files))
-            split_idx = int(0.8 * len(all_files))
-            selected_indices = indices[:split_idx] if split == "train" else indices[split_idx:]
-            self.items = [all_files[i] for i in selected_indices]
+        if speaker_disjoint:
+            # 80% speakers for train, 20% speakers disjoint for open-set verification
+            split_idx = max(1, int(0.8 * len(spk_dirs)))
+            active_dirs = spk_dirs[:split_idx] if split == "train" else spk_dirs[split_idx:]
+            if not active_dirs:
+                active_dirs = spk_dirs[-1:]
         else:
-            self.speaker_to_id = {}
+            active_dirs = spk_dirs
+
+        self.speaker_to_id = {d.name: idx for idx, d in enumerate(active_dirs)}
+        for d in active_dirs:
+            spk_id = self.speaker_to_id[d.name]
+            files = sorted(d.glob("*/*.wav"))
+            if files:
+                self.speaker_files[spk_id] = files
+                for f in files:
+                    self.items.append((f, spk_id))
+
+        if strict and not self.items:
+            raise FileNotFoundError(f"No WAV audio files found for VoxCeleb split={split} in {self.vox_root}")
 
     def __len__(self) -> int:
-        return max(1, len(self.items))
+        return len(self.items)
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
         if not self.items:
-            return torch.zeros(TOTAL_WINDOW_SAMPLES, dtype=torch.float32), 0
-        fp, spk_id = self.items[idx % len(self.items)]
-        try:
-            wav = load_raw_pcm16(fp)
-        except Exception:
-            wav = np.zeros(TOTAL_WINDOW_SAMPLES, dtype=np.float32)
+            raise IndexError("VoxCeleb dataset is empty.")
+        fp, spk_id = self.items[idx]
+        wav = load_raw_pcm16(fp)
         return torch.from_numpy(wav), spk_id
 
 
 class RAVDESSRawDataset(Dataset):
-    """Raw waveform dataset for RAVDESS Speech Emotion Recognition."""
+    """Raw waveform dataset for RAVDESS Speech Emotion Recognition.
+    
+    Enforces verified file presence; rejects missing or corrupted assets.
+    """
 
-    def __init__(self, actors: List[int], metadata_csv: Path = RAVDESS_CSV, speech_root: Path = RAVDESS_ROOT):
+    def __init__(
+        self,
+        actors: List[int],
+        metadata_csv: Path = RAVDESS_CSV,
+        speech_root: Path = RAVDESS_ROOT,
+        strict: bool = True,
+    ):
         self.speech_root = Path(speech_root)
-        if metadata_csv.exists():
-            df = pd.read_csv(metadata_csv)
-            self.df = df[df["actor_id"].isin(actors)].reset_index(drop=True)
-        else:
+        self.metadata_csv = Path(metadata_csv)
+        if not self.metadata_csv.exists():
+            if strict:
+                raise FileNotFoundError(f"RAVDESS metadata CSV not found: {self.metadata_csv}")
             self.df = pd.DataFrame()
+            return
+
+        df = pd.read_csv(self.metadata_csv)
+        self.df = df[df["actor_id"].isin(actors)].reset_index(drop=True)
+
+        if strict:
+            if not self.speech_root.exists():
+                raise FileNotFoundError(f"RAVDESS speech root directory not found: {self.speech_root}")
+            valid_rows = []
+            for _, row in self.df.iterrows():
+                fp = self.speech_root / row["relative_path"]
+                if fp.exists():
+                    valid_rows.append(row)
+            if not valid_rows:
+                raise FileNotFoundError(f"No RAVDESS audio files found in {self.speech_root} for actors {actors}")
+            self.df = pd.DataFrame(valid_rows).reset_index(drop=True)
 
     def __len__(self) -> int:
-        return max(1, len(self.df))
+        return len(self.df)
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
         if len(self.df) == 0:
-            return torch.zeros(TOTAL_WINDOW_SAMPLES, dtype=torch.float32), 0
-        row = self.df.iloc[idx % len(self.df)]
+            raise IndexError("RAVDESS dataset is empty.")
+        row = self.df.iloc[idx]
         fp = self.speech_root / row["relative_path"]
-        try:
-            wav = load_raw_pcm16(fp)
-        except Exception:
-            wav = np.zeros(TOTAL_WINDOW_SAMPLES, dtype=np.float32)
+        wav = load_raw_pcm16(fp)
         label = int(row["emotion_id"])
         return torch.from_numpy(wav), label
+
+
+def compute_equal_error_rate(genuine_scores: np.ndarray, impostor_scores: np.ndarray) -> Tuple[float, float, float]:
+    """Calculate Equal Error Rate (EER), ROC-AUC, and optimal threshold from genuine & impostor trials."""
+    if len(genuine_scores) == 0 or len(impostor_scores) == 0:
+        return 0.5, 0.5, 0.0
+
+    y_true = np.concatenate([np.ones_like(genuine_scores), np.zeros_like(impostor_scores)])
+    y_scores = np.concatenate([genuine_scores, impostor_scores])
+
+    try:
+        auc = float(roc_auc_score(y_true, y_scores))
+    except Exception:
+        auc = 0.5
+
+    # Evaluate FAR & FRR across candidate thresholds
+    thresholds = np.linspace(-1.0, 1.0, 201)
+    far_list, frr_list = [], []
+    for th in thresholds:
+        far = np.mean(impostor_scores >= th)
+        frr = np.mean(genuine_scores < th)
+        far_list.append(far)
+        frr_list.append(frr)
+
+    far_arr = np.array(far_list)
+    frr_arr = np.array(frr_list)
+    diff = np.abs(far_arr - frr_arr)
+    min_idx = np.argmin(diff)
+    eer = float((far_arr[min_idx] + frr_arr[min_idx]) / 2.0)
+    opt_th = float(thresholds[min_idx])
+    return eer, auc, opt_th
+
+
+def evaluate_open_set_speaker_verification(
+    model: nn.Module,
+    dataset: VoxCelebRawDataset,
+    device: torch.device,
+    num_pairs: int = 100,
+) -> Dict[str, float]:
+    """Evaluate open-set speaker verification on genuine & impostor pairs."""
+    model.eval()
+    if not dataset.speaker_files or len(dataset.speaker_files) < 2:
+        return {"spk_eer": 0.5, "spk_auc": 0.5, "spk_threshold": 0.0}
+
+    import random
+    spk_ids = [k for k, v in dataset.speaker_files.items() if len(v) >= 1]
+    if len(spk_ids) < 2:
+        return {"spk_eer": 0.5, "spk_auc": 0.5, "spk_threshold": 0.0}
+
+    genuine_scores = []
+    impostor_scores = []
+
+    with torch.no_grad():
+        # Genuine trials: pairs from the same speaker
+        for _ in range(num_pairs // 2):
+            candidates = [s for s in spk_ids if len(dataset.speaker_files[s]) >= 2]
+            if not candidates:
+                break
+            spk = random.choice(candidates)
+            f1, f2 = random.sample(dataset.speaker_files[spk], 2)
+            w1 = torch.from_numpy(load_raw_pcm16(f1)).unsqueeze(0).to(device)
+            w2 = torch.from_numpy(load_raw_pcm16(f2)).unsqueeze(0).to(device)
+            _, emb1, _ = process_audio_in_streaming_chunks(model, w1)
+            _, emb2, _ = process_audio_in_streaming_chunks(model, w2)
+            sim = F.cosine_similarity(emb1, emb2).item()
+            genuine_scores.append(sim)
+
+        # Impostor trials: pairs from different speakers
+        for _ in range(num_pairs // 2):
+            spk1, spk2 = random.sample(spk_ids, 2)
+            f1 = random.choice(dataset.speaker_files[spk1])
+            f2 = random.choice(dataset.speaker_files[spk2])
+            w1 = torch.from_numpy(load_raw_pcm16(f1)).unsqueeze(0).to(device)
+            w2 = torch.from_numpy(load_raw_pcm16(f2)).unsqueeze(0).to(device)
+            _, emb1, _ = process_audio_in_streaming_chunks(model, w1)
+            _, emb2, _ = process_audio_in_streaming_chunks(model, w2)
+            sim = F.cosine_similarity(emb1, emb2).item()
+            impostor_scores.append(sim)
+
+    if not genuine_scores or not impostor_scores:
+        return {"spk_eer": 0.5, "spk_auc": 0.5, "spk_threshold": 0.0}
+
+    eer, auc, th = compute_equal_error_rate(np.array(genuine_scores), np.array(impostor_scores))
+    return {"spk_eer": eer, "spk_auc": auc, "spk_threshold": th}
 
 
 class MultiTaskUncertaintyLoss(nn.Module):
@@ -350,12 +524,13 @@ def train_multitask_epoch(
 
 
 def evaluate_multitask(
-    model: MultiTaskStreamingWavLM,
+    model: nn.Module,
     arc_margin: ArcMarginProduct,
     loader_urban_val: DataLoader,
     loader_vox_val: DataLoader,
     loader_ravdess_val: DataLoader,
     device: torch.device,
+    ds_vox_val: Optional[VoxCelebRawDataset] = None,
 ) -> Dict[str, float]:
     """Validate all three multi-task heads on held-out evaluation sets."""
     model.eval()
@@ -376,7 +551,7 @@ def evaluate_multitask(
     metrics["scene_acc"] = float(accuracy_score(all_scene_targets, all_scene_preds)) if all_scene_targets else 0.0
     metrics["scene_f1"] = float(f1_score(all_scene_targets, all_scene_preds, average="macro", zero_division=0)) if all_scene_targets else 0.0
 
-    # 2. Evaluate VoxCeleb Speaker ID
+    # 2. Evaluate VoxCeleb Speaker ID (Closed-Set)
     all_spk_preds, all_spk_targets = [], []
     with torch.no_grad():
         for x_v, y_v in loader_vox_val:
@@ -388,6 +563,15 @@ def evaluate_multitask(
             all_spk_targets.extend(y_v.numpy())
 
     metrics["spk_top1"] = float(accuracy_score(all_spk_targets, all_spk_preds)) if all_spk_targets else 0.0
+
+    # 2b. Evaluate Open-Set Speaker Verification (Genuine vs Impostor EER & ROC-AUC)
+    if ds_vox_val is not None and len(ds_vox_val) > 0:
+        spk_verif = evaluate_open_set_speaker_verification(model, ds_vox_val, device)
+        metrics["spk_eer"] = spk_verif.get("spk_eer", 0.5)
+        metrics["spk_auc"] = spk_verif.get("spk_auc", 0.5)
+    else:
+        metrics["spk_eer"] = 0.5
+        metrics["spk_auc"] = 0.5
 
     # 3. Evaluate RAVDESS Speech Emotion
     all_emo_preds, all_emo_targets = [], []
@@ -402,13 +586,14 @@ def evaluate_multitask(
     metrics["emo_acc"] = float(accuracy_score(all_emo_targets, all_emo_preds)) if all_emo_targets else 0.0
     metrics["emo_f1"] = float(f1_score(all_emo_targets, all_emo_preds, average="macro", zero_division=0)) if all_emo_targets else 0.0
 
-    # Composite Harmonic Score across all 3 tasks
-    metrics["composite_score"] = (metrics["scene_f1"] + metrics["spk_top1"] + metrics["emo_f1"]) / 3.0
+    # Composite Harmonic Score across all 3 tasks (inverting EER so higher is better: 1 - EER)
+    spk_score = 1.0 - metrics["spk_eer"]
+    metrics["composite_score"] = (metrics["scene_f1"] + spk_score + metrics["emo_f1"]) / 3.0
     return metrics
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Joint Multi-Task Streaming WavLM Training Pipeline")
+    parser = argparse.ArgumentParser(description="Joint Multi-Task Streaming Transformer Training Pipeline")
     parser.add_argument("--epochs", type=int, default=15, help="Number of training epochs")
     parser.add_argument("--batch-size", type=int, default=16, help="Per-task batch size")
     parser.add_argument("--lr", type=float, default=3e-4, help="Peak learning rate for AdamW")
@@ -419,21 +604,38 @@ def main():
     args = parser.parse_args()
 
     device = get_device()
-    print(f"[MultiTask WavLM] Initializing Joint Training on Device: {device}...")
+    print(f"[Causal MultiTask Transformer] Initializing Joint Training on Device: {device}...")
 
     # DataLoaders: UrbanSound8K
     train_folds = [f for f in range(1, 11) if f != args.val_fold]
-    ds_urban_train = UrbanSoundRawDataset(folds=train_folds)
-    ds_urban_val = UrbanSoundRawDataset(folds=[args.val_fold])
+    ds_urban_train = UrbanSoundRawDataset(folds=train_folds, strict=False)
+    ds_urban_val = UrbanSoundRawDataset(folds=[args.val_fold], strict=False)
 
-    # DataLoaders: VoxCeleb
-    ds_vox_train = VoxCelebRawDataset(max_speakers=args.max_speakers, split="train")
-    ds_vox_val = VoxCelebRawDataset(max_speakers=args.max_speakers, split="val")
+    # DataLoaders: VoxCeleb (Disjoint speakers for unseen open-set evaluation)
+    ds_vox_train = VoxCelebRawDataset(max_speakers=args.max_speakers, split="train", speaker_disjoint=True, strict=False)
+    ds_vox_val = VoxCelebRawDataset(max_speakers=args.max_speakers, split="val", speaker_disjoint=True, strict=False)
     num_speakers = max(2, len(ds_vox_train.speaker_to_id))
 
     # DataLoaders: RAVDESS (Actors 1-18 train, Actors 19-24 val)
-    ds_ravdess_train = RAVDESSRawDataset(actors=list(range(1, 19)))
-    ds_ravdess_val = RAVDESSRawDataset(actors=list(range(19, 25)))
+    ds_ravdess_train = RAVDESSRawDataset(actors=list(range(1, 19)), strict=False)
+    ds_ravdess_val = RAVDESSRawDataset(actors=list(range(19, 25)), strict=False)
+
+    # Strict Dataset Pre-Validation: fail before starting training if datasets are insufficient
+    if len(ds_urban_train) < args.batch_size:
+        raise ValueError(
+            f"UrbanSound training dataset has {len(ds_urban_train)} samples, which is fewer than batch_size={args.batch_size}.\n"
+            f"Check that UrbanSound8K audio files are populated before starting multi-task training."
+        )
+    if len(ds_vox_train) < args.batch_size:
+        raise ValueError(
+            f"VoxCeleb training dataset has {len(ds_vox_train)} samples, which is fewer than batch_size={args.batch_size}.\n"
+            f"Check that VoxCeleb audio files are populated before starting multi-task training."
+        )
+    if len(ds_ravdess_train) < args.batch_size:
+        raise ValueError(
+            f"RAVDESS training dataset has {len(ds_ravdess_train)} samples, which is fewer than batch_size={args.batch_size}.\n"
+            f"Check that RAVDESS audio files are populated before starting multi-task training."
+        )
 
     loader_urban_train = DataLoader(ds_urban_train, batch_size=args.batch_size, shuffle=True, drop_last=True)
     loader_urban_val = DataLoader(ds_urban_val, batch_size=args.batch_size, shuffle=False)
@@ -445,14 +647,14 @@ def main():
     loader_ravdess_val = DataLoader(ds_ravdess_val, batch_size=args.batch_size, shuffle=False)
 
     print(
-        f"[MultiTask WavLM] Datasets loaded:\n"
+        f"[Causal MultiTask Transformer] Datasets verified:\n"
         f"  - UrbanSound: {len(ds_urban_train)} train, {len(ds_urban_val)} val (Fold {args.val_fold})\n"
-        f"  - VoxCeleb:   {len(ds_vox_train)} train, {len(ds_vox_val)} val ({num_speakers} speakers)\n"
+        f"  - VoxCeleb:   {len(ds_vox_train)} train, {len(ds_vox_val)} val ({num_speakers} speakers, disjoint)\n"
         f"  - RAVDESS:    {len(ds_ravdess_train)} train, {len(ds_ravdess_val)} val\n"
     )
 
-    # Initialize MultiTask Model
-    model = MultiTaskStreamingWavLM(
+    # Initialize Causal Multi-Task Model
+    model = CausalMultiTaskAudioTransformer(
         hidden_dim=256,
         num_layers=6,
         num_heads=4,
@@ -486,6 +688,11 @@ def main():
     best_composite = -1.0
     best_ckpt_path = CHECKPOINTS_DIR / "best_multitask_streaming_wavlm.pt"
 
+    # Task-Specific Promotion Gates
+    GATE_MIN_SCENE_F1 = 0.50
+    GATE_MAX_SPK_EER = 0.25
+    GATE_MIN_EMO_F1 = 0.50
+
     t_start = time.time()
 
     for epoch in range(1, args.epochs + 1):
@@ -510,47 +717,60 @@ def main():
             loader_vox_val=loader_vox_val,
             loader_ravdess_val=loader_ravdess_val,
             device=device,
+            ds_vox_val=ds_vox_val,
         )
 
         comp = val_metrics["composite_score"]
+        spk_eer = val_metrics["spk_eer"]
+        passes_gates = (
+            val_metrics["scene_f1"] >= GATE_MIN_SCENE_F1
+            and spk_eer <= GATE_MAX_SPK_EER
+            and val_metrics["emo_f1"] >= GATE_MIN_EMO_F1
+        )
+
         print(
             f"Epoch [{epoch:02d}/{args.epochs:02d}] "
             f"Loss: {losses['total']:.4f} | "
-            f"Scene F1: {val_metrics['scene_f1']:.4f} (Acc: {val_metrics['scene_acc']*100:.1f}%) | "
-            f"Spk Top-1: {val_metrics['spk_top1']*100:.1f}% | "
-            f"SER F1: {val_metrics['emo_f1']:.4f} (Acc: {val_metrics['emo_acc']*100:.1f}%) | "
-            f"Composite: {comp:.4f}"
+            f"Scene F1: {val_metrics['scene_f1']:.4f} | "
+            f"Spk EER: {spk_eer*100:.1f}% (Top-1: {val_metrics['spk_top1']*100:.1f}%) | "
+            f"SER F1: {val_metrics['emo_f1']:.4f} | "
+            f"Composite: {comp:.4f} | Gates: {'PASSED' if passes_gates else 'HELD'}"
         )
 
-        if comp > best_composite:
+        if comp > best_composite and passes_gates:
             best_composite = comp
             torch.save(model.state_dict(), best_ckpt_path)
-            print(f"  ⭐ New Best Multi-Task Composite Score: {comp:.4f}! Saved to {best_ckpt_path.name}")
+            print(f"  ⭐ New Best Multi-Task Candidate Saved: {comp:.4f} (All Promotion Gates Met)")
 
     total_time = time.time() - t_start
-    print(f"\n[MultiTask WavLM] Training completed in {total_time/60:.2f} mins. Best Composite: {best_composite:.4f}")
+    print(f"\n[Causal MultiTask Transformer] Training completed in {total_time/60:.2f} mins. Best Composite: {best_composite:.4f}")
 
     # Track experiment in Ruflo registry
     tracker.log_run(
         experiment="multitask_streaming_wavlm",
-        val_accuracy=float(best_composite),
-        val_macro_f1=float(best_composite),
-        per_class_f1={"composite": float(best_composite)},
+        val_accuracy=float(best_composite if best_composite > 0 else 0.0),
+        val_macro_f1=float(best_composite if best_composite > 0 else 0.0),
+        per_class_f1={"composite": float(best_composite if best_composite > 0 else 0.0)},
         hyperparameters={
-            "architecture": "MultiTaskStreamingWavLM",
+            "architecture": "CausalMultiTaskAudioTransformer",
             "epochs": args.epochs,
             "lr": args.lr,
             "val_fold": args.val_fold,
             "max_speakers": args.max_speakers,
             "early_tap_layer": 2,
             "deep_tap_layer": 6,
+            "promotion_gates": {
+                "min_scene_f1": GATE_MIN_SCENE_F1,
+                "max_spk_eer": GATE_MAX_SPK_EER,
+                "min_emo_f1": GATE_MIN_EMO_F1,
+            },
         },
-        checkpoint_path=best_ckpt_path,
+        checkpoint_path=best_ckpt_path if best_ckpt_path.exists() else None,
         epochs=args.epochs,
     )
 
     if args.export_onnx and best_ckpt_path.exists():
-        print("[MultiTask WavLM] Exporting trained checkpoint to static ONNX model...")
+        print("[Causal MultiTask Transformer] Exporting trained checkpoint to static ONNX model...")
         export_streaming_wavlm_to_onnx(
             checkpoint_path=best_ckpt_path,
             static_shapes=True,

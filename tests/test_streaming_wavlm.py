@@ -17,6 +17,7 @@ from pipeline.streaming_wavlm import (
     CausalConv1d,
     ConvFeatureEncoder,
     CausalSelfAttention,
+    CausalMultiTaskAudioTransformer,
     MultiTaskStreamingWavLM,
     export_streaming_wavlm_to_onnx,
 )
@@ -44,6 +45,26 @@ class TestStreamingWavLMArchitecture:
         diff = torch.max(torch.abs(out_a[:, :, :valid_frames] - out_b[:, :, :valid_frames])).item()
         assert diff < 1e-6, f"CausalConv1d violated causality: diff = {diff}"
 
+    def test_full_encoder_strict_causality_invariant(self):
+        """Modifying the second half of an audio chunk must NOT alter earlier encoder output frames.
+        
+        Verifies that CausalChannelNorm computes statistics strictly per time frame with 0 temporal leakage.
+        """
+        encoder = ConvFeatureEncoder(hidden_dim=64).eval()
+
+        audio_a = torch.randn(1, 1, 3200)
+        audio_b = audio_a.clone()
+        # Strongly perturb future samples in the second half
+        audio_b[:, :, 1600:] = torch.randn(1, 1, 1600) * 10.0
+
+        with torch.no_grad():
+            feat_a = encoder(audio_a)  # (1, 10, 64)
+            feat_b = encoder(audio_b)  # (1, 10, 64)
+
+        # First 3 frames depend strictly on audio samples < 1600 (cumulative receptive field < 1200 samples)
+        diff = torch.max(torch.abs(feat_a[:, :3, :] - feat_b[:, :3, :])).item()
+        assert diff < 1e-5, f"Temporal future leakage detected in ConvFeatureEncoder: max diff = {diff}"
+
     def test_causal_self_attention_causality(self):
         """Attention weights must never attend to future tokens within a chunk."""
         attn = CausalSelfAttention(hidden_dim=64, num_heads=2, max_past_frames=20).eval()
@@ -58,7 +79,7 @@ class TestStreamingWavLMArchitecture:
 
     def test_multitask_streaming_wavlm_shapes(self):
         """Verify multi-task head output shapes and L2 normalization of voiceprints."""
-        model = MultiTaskStreamingWavLM(
+        model = CausalMultiTaskAudioTransformer(
             hidden_dim=64,
             num_layers=4,
             num_heads=2,
@@ -236,4 +257,73 @@ class TestMultiTaskTrainingPipeline:
         assert model.voiceprint_head.projection[0].weight.grad is not None
         assert model.emotion_head.classifier[0].weight.grad is not None
         assert arc_margin.weight.grad is not None
+
+    def test_speaker_verification_eer_computation(self):
+        """Verify Equal Error Rate (EER) and ROC-AUC calculation on genuine/impostor score distributions."""
+        from pipeline.train_streaming_wavlm import compute_equal_error_rate
+
+        rng = np.random.RandomState(42)
+        genuine_scores = rng.normal(loc=0.75, scale=0.10, size=200)
+        impostor_scores = rng.normal(loc=0.15, scale=0.12, size=200)
+
+        eer, auc, th = compute_equal_error_rate(genuine_scores, impostor_scores)
+        assert eer < 0.05, f"Expected EER < 0.05 for separated distributions, got {eer}"
+        assert auc > 0.98, f"Expected AUC > 0.98, got {auc}"
+        assert 0.3 < th < 0.6, f"Expected optimal threshold in [0.3, 0.6], got {th}"
+
+    def test_dataset_loaders_reject_missing_data(self):
+        """Verify dataset loaders fail with FileNotFoundError when paths/data do not exist."""
+        from pipeline.train_streaming_wavlm import (
+            UrbanSoundRawDataset,
+            VoxCelebRawDataset,
+            RAVDESSRawDataset,
+        )
+
+        with pytest.raises(FileNotFoundError):
+            UrbanSoundRawDataset(
+                folds=[1],
+                audio_dir=Path("non_existent_audio_dir_xyz"),
+                strict=True,
+            )
+
+        with pytest.raises(FileNotFoundError):
+            VoxCelebRawDataset(
+                vox_root=Path("non_existent_vox_dir_xyz"),
+                strict=True,
+            )
+
+        with pytest.raises(FileNotFoundError):
+            RAVDESSRawDataset(
+                actors=[1],
+                metadata_csv=Path("non_existent_ravdess_meta.csv"),
+                strict=True,
+            )
+
+    def test_synthetic_noise_all_classes_and_unsupported_rejection(self):
+        """Verify all 10 UrbanSound classes synthesize valid audio and unsupported classes raise ValueError."""
+        from pipeline.urban_noise_mixer import generate_synthetic_noise
+        from pipeline.config import CLASSES
+
+        for cls_name in CLASSES:
+            noise = generate_synthetic_noise(cls_name, num_samples=3200)
+            assert len(noise) == 3200
+            assert np.all(np.isfinite(noise)), f"Non-finite values in {cls_name}"
+            assert float(np.std(noise)) > 0.01, f"Zero-energy or flat noise in {cls_name}"
+
+        # Reject unsupported noise class
+        with pytest.raises(ValueError):
+            generate_synthetic_noise("non_existent_noise_type_xyz", num_samples=3200)
+
+
+class TestStreamingWavLMExportCheckpoints:
+    """Validate strict checkpoint loading and failure modes during ONNX export."""
+
+    def test_onnx_export_fails_closed_when_checkpoint_missing(self):
+        """Exporting to ONNX in strict mode must fail with FileNotFoundError if checkpoint is missing."""
+        with pytest.raises(FileNotFoundError):
+            export_streaming_wavlm_to_onnx(
+                checkpoint_path=Path("non_existent_ckpt_12345.pt"),
+                strict_checkpoints=True,
+            )
+
 

@@ -57,13 +57,22 @@ app.add_middleware(
 _analyzer: Optional[UnifiedAudioAnalyzer] = None
 
 
+MAX_AUDIO_DURATION_SECONDS = 300.0  # 5 minutes limit
+
+
 def get_analyzer() -> UnifiedAudioAnalyzer:
     global _analyzer
     if _analyzer is None:
-        # Prioritize loading real trained checkpoints; fallback to demo mode only if missing
+        require_trained = os.getenv("REQUIRE_TRAINED_CHECKPOINTS", "0").strip().lower() in ("1", "true", "yes")
         try:
-            _analyzer = UnifiedAudioAnalyzer(strict_checkpoints=False, demo_mode=False)
-        except Exception:
+            # First attempt strict checkpoint loading
+            _analyzer = UnifiedAudioAnalyzer(strict_checkpoints=True, demo_mode=False)
+        except Exception as e:
+            if require_trained:
+                raise RuntimeError(
+                    f"Production server refused to serve inference: Trained checkpoints are strictly required: {e}"
+                )
+            logger.warning("Checkpoints missing or incomplete; falling back to explicit demo_mode=True: %s", e)
             _analyzer = UnifiedAudioAnalyzer(strict_checkpoints=False, demo_mode=True)
     return _analyzer
 
@@ -147,13 +156,25 @@ async def analyze_audio(
     snr_db: float = Form(10.0),
 ):
     """Analyze uploaded audio file using the unified multi-task intelligence pipeline."""
-    # 1. Enforce payload size limit
-    content = await file.read()
-    if len(content) > MAX_UPLOAD_BYTES:
-        raise HTTPException(
-            status_code=413,
-            detail=f"Payload Too Large: Audio file size ({len(content) / (1024 * 1024):.1f} MB) exceeds 25 MB limit.",
-        )
+    # 1. Enforce payload size limit in bounded chunks (prevents allocating unbounded memory upfront)
+    CHUNK_SIZE = 64 * 1024  # 64 KB
+    total_bytes = 0
+    buffer = io.BytesIO()
+    while True:
+        chunk = await file.read(CHUNK_SIZE)
+        if not chunk:
+            break
+        total_bytes += len(chunk)
+        if total_bytes > MAX_UPLOAD_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Payload Too Large: File exceeded 25 MB limit ({total_bytes / (1024 * 1024):.1f} MB uploaded).",
+            )
+        buffer.write(chunk)
+    content = buffer.getvalue()
+
+    if len(content) == 0:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty (0 bytes).")
 
     # 2. Decode audio waveform
     try:
@@ -164,6 +185,18 @@ async def analyze_audio(
 
     if len(waveform) == 0:
         raise HTTPException(status_code=400, detail="Uploaded audio file contains 0 audio samples.")
+
+    # Validate finite values
+    if not np.all(np.isfinite(waveform)):
+        raise HTTPException(status_code=400, detail="Audio waveform contains non-finite values (NaN or Inf).")
+
+    # Validate maximum duration (300 seconds)
+    duration_sec = len(waveform) / float(sr) if sr > 0 else 0.0
+    if duration_sec > MAX_AUDIO_DURATION_SECONDS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Audio duration ({duration_sec:.1f}s) exceeds the maximum limit of {MAX_AUDIO_DURATION_SECONDS}s.",
+        )
 
     # Convert multi-channel to mono
     if waveform.ndim > 1:
