@@ -17,14 +17,20 @@ import torch
 import soundfile as sf
 
 from pipeline.config import BASE_DIR, CHECKPOINTS_DIR, CLASSES, ID_TO_CLASS, SAMPLE_RATE, TARGET_SAMPLES
-from pipeline.audio_loader import load_full_audio, preprocess_audio_window, compute_log_mel_spectrogram
-from pipeline.model import AudioCNN
-from pipeline.emotion_model import EmotionClassifierCNN
+from pipeline.audio_loader import (
+    load_full_audio,
+    preprocess_audio_window,
+    compute_log_mel_spectrogram,
+    compute_cmvn_log_mel_spectrogram,
+)
+from pipeline.model import AudioCNN, SEAudioCNN, SpeakerEmbeddingNet, SESpeakerEmbeddingNet
+from pipeline.emotion_model import EmotionClassifierCNN, SEEmotionClassifierCNN, SSLEmotionClassifier
 from pipeline.emotion_dataset import EMOTIONS
-from pipeline.speaker_id import SpeakerEmbeddingNet, SpeakerIdentifier
+from pipeline.speaker_id import SpeakerIdentifier
 from pipeline.diarization import SpeakerDiarizer
 from pipeline.device import get_device
 from pipeline.ruflo_tracker import RufloExperimentTracker
+
 
 
 def compute_file_sha256(path: Path) -> str:
@@ -56,15 +62,21 @@ class UnifiedAudioAnalyzer:
         self.demo_mode = demo_mode
 
         # 1. Environmental Audio Classifier (UrbanSound8K)
-        self.urban_model = AudioCNN().to(self.device)
         self.urban_checkpoint_loaded = False
         self.urban_checkpoint_path: Optional[Path] = None
         self.urban_checkpoint_sha256: Optional[str] = None
+        self.use_cmvn = False
 
         chk = sorted(list(CHECKPOINTS_DIR.glob("best_model_fold*.pt")))
         if chk:
             self.urban_checkpoint_path = chk[0]
             state = torch.load(chk[0], map_location=self.device)
+            model_type = state.get("model_type", "baseline")
+            self.use_cmvn = state.get("use_cmvn", False)
+            if model_type == "se_cnn":
+                self.urban_model = SEAudioCNN().to(self.device)
+            else:
+                self.urban_model = AudioCNN().to(self.device)
             self.urban_model.load_state_dict(state["model_state"])
             self.urban_checkpoint_loaded = True
             self.urban_checkpoint_sha256 = compute_file_sha256(chk[0])
@@ -73,10 +85,11 @@ class UnifiedAudioAnalyzer:
                 f"Required UrbanSound checkpoint missing in {CHECKPOINTS_DIR}. "
                 "Train fold model or pass demo_mode=True to run with synthetic demo weights."
             )
+        else:
+            self.urban_model = AudioCNN().to(self.device)
         self.urban_model.eval()
 
         # 2. Emotion Classifier (RAVDESS)
-        self.emotion_model = EmotionClassifierCNN().to(self.device)
         self.emotion_checkpoint_loaded = False
         self.emotion_checkpoint_path: Optional[Path] = None
         self.emotion_checkpoint_sha256: Optional[str] = None
@@ -85,6 +98,13 @@ class UnifiedAudioAnalyzer:
         if emo_chk.exists():
             self.emotion_checkpoint_path = emo_chk
             emo_state = torch.load(emo_chk, map_location=self.device)
+            emo_model_type = emo_state.get("model_type", "baseline")
+            if emo_model_type == "se_cnn":
+                self.emotion_model = SEEmotionClassifierCNN().to(self.device)
+            elif emo_model_type == "ssl":
+                self.emotion_model = SSLEmotionClassifier().to(self.device)
+            else:
+                self.emotion_model = EmotionClassifierCNN().to(self.device)
             self.emotion_model.load_state_dict(emo_state["model_state"])
             self.emotion_checkpoint_loaded = True
             self.emotion_checkpoint_sha256 = compute_file_sha256(emo_chk)
@@ -93,10 +113,11 @@ class UnifiedAudioAnalyzer:
                 f"Required Emotion checkpoint best_emotion_model.pt missing in {CHECKPOINTS_DIR}. "
                 "Train emotion model or pass demo_mode=True to run with synthetic demo weights."
             )
+        else:
+            self.emotion_model = EmotionClassifierCNN().to(self.device)
         self.emotion_model.eval()
 
         # 3. Speaker ID & Diarizer (VoxCeleb)
-        self.speaker_net = SpeakerEmbeddingNet().to(self.device)
         self.speaker_checkpoint_loaded = False
         self.speaker_checkpoint_path: Optional[Path] = None
         self.speaker_checkpoint_sha256: Optional[str] = None
@@ -105,6 +126,8 @@ class UnifiedAudioAnalyzer:
         if spk_chk.exists():
             self.speaker_checkpoint_path = spk_chk
             spk_state = torch.load(spk_chk, map_location=self.device)
+            spk_backbone = spk_state.get("backbone", "baseline")
+            self.speaker_net = SpeakerEmbeddingNet(backbone=spk_backbone).to(self.device)
             self.speaker_net.load_state_dict(spk_state["model_state"])
             self.speaker_checkpoint_loaded = True
             self.speaker_checkpoint_sha256 = compute_file_sha256(spk_chk)
@@ -113,7 +136,10 @@ class UnifiedAudioAnalyzer:
                 f"Required Speaker embedding checkpoint best_speaker_model.pt missing in {CHECKPOINTS_DIR}. "
                 "Train speaker model or pass demo_mode=True to run with synthetic demo weights."
             )
+        else:
+            self.speaker_net = SpeakerEmbeddingNet().to(self.device)
         self.speaker_net.eval()
+
 
         self.speaker_identifier = SpeakerIdentifier(model=self.speaker_net, device=self.device)
         self.diarizer = SpeakerDiarizer(embedding_net=self.speaker_net, device=self.device)
@@ -144,40 +170,30 @@ class UnifiedAudioAnalyzer:
             }
 
         # Step 1: Detect Environmental Acoustic Background across Continuous Audio
-        # Includes all 4.0s chunks plus tail-end coverage
+        # Vectorized batch processing across 4.0s windows
+        spec_fn = compute_cmvn_log_mel_spectrogram if getattr(self, "use_cmvn", False) else compute_log_mel_spectrogram
         window_samples = TARGET_SAMPLES
+        chunks = []
         if len(waveform) <= window_samples:
-            env_wave = preprocess_audio_window(waveform, target_samples=window_samples)
-            spec = compute_log_mel_spectrogram(env_wave)
-            spec_tensor = torch.from_numpy(spec).unsqueeze(0).unsqueeze(0).float().to(self.device)
-            with torch.no_grad():
-                urban_probs = torch.softmax(self.urban_model(spec_tensor), dim=-1)[0].cpu().numpy()
+            chunks.append(preprocess_audio_window(waveform, target_samples=window_samples))
         else:
-            window_probs = []
             for st in range(0, len(waveform) - window_samples + 1, window_samples):
-                chunk = waveform[st : st + window_samples]
-                spec = compute_log_mel_spectrogram(chunk)
-                spec_tensor = torch.from_numpy(spec).unsqueeze(0).unsqueeze(0).float().to(self.device)
-                with torch.no_grad():
-                    p = torch.softmax(self.urban_model(spec_tensor), dim=-1)[0].cpu().numpy()
-                    window_probs.append(p)
+                chunks.append(waveform[st : st + window_samples])
 
             # Evaluate partial tail window to guarantee full coverage
             tail_samples = len(waveform) % window_samples
             if tail_samples >= int(0.25 * SAMPLE_RATE):
-                tail_chunk = waveform[-window_samples:]
-                spec = compute_log_mel_spectrogram(tail_chunk)
-                spec_tensor = torch.from_numpy(spec).unsqueeze(0).unsqueeze(0).float().to(self.device)
-                with torch.no_grad():
-                    window_probs.append(torch.softmax(self.urban_model(spec_tensor), dim=-1)[0].cpu().numpy())
+                chunks.append(waveform[-window_samples:])
 
-            if not window_probs:
-                env_wave = preprocess_audio_window(waveform, target_samples=window_samples)
-                spec = compute_log_mel_spectrogram(env_wave)
-                spec_tensor = torch.from_numpy(spec).unsqueeze(0).unsqueeze(0).float().to(self.device)
-                with torch.no_grad():
-                    window_probs.append(torch.softmax(self.urban_model(spec_tensor), dim=-1)[0].cpu().numpy())
-            urban_probs = np.mean(window_probs, axis=0)
+            if not chunks:
+                chunks.append(preprocess_audio_window(waveform, target_samples=window_samples))
+
+        specs_list = [spec_fn(c) for c in chunks]
+        batch_spec_tensor = torch.from_numpy(np.stack(specs_list, axis=0)).unsqueeze(1).float().to(self.device)
+        with torch.no_grad():
+            batch_logits = self.urban_model(batch_spec_tensor)
+            batch_probs = torch.softmax(batch_logits, dim=-1).cpu().numpy()
+            urban_probs = np.mean(batch_probs, axis=0)
 
         top_urban_idx = int(np.argmax(urban_probs))
         env_scene = ID_TO_CLASS[top_urban_idx]
@@ -185,40 +201,50 @@ class UnifiedAudioAnalyzer:
 
         # Step 2: Full-Recording Speaker Diarization with timeline invariants
         segments = self.diarizer.diarize(waveform, num_speakers=num_speakers)
-        turns_analysis = []
 
-        # Step 3 & 4: Speaker ID & Emotion Recognition per Speech Turn
+        # Step 3 & 4: Batched Speaker ID & Emotion Recognition per Speech Turn
+        valid_segments = []
+        seg_waves = []
+        turn_embeddings = []
+
         for seg in segments:
             st_idx = max(0, int(seg.start * SAMPLE_RATE))
             et_idx = min(len(waveform), int(seg.end * SAMPLE_RATE))
-            if et_idx <= st_idx:
-                continue
-            seg_wave = waveform[st_idx:et_idx]
+            if et_idx > st_idx:
+                valid_segments.append(seg)
+                seg_waves.append(waveform[st_idx:et_idx])
+                turn_embeddings.append(seg.embedding)
 
-            # Speaker identification
-            identified_spk, spk_conf = self.speaker_identifier.identify(seg_wave)
+        turns_analysis = []
+        if valid_segments:
+            # 1. Batched Speaker Identification reusing precomputed turn embeddings from diarization
+            turn_embs_arr = np.stack(turn_embeddings, axis=0)
+            id_results = self.speaker_identifier.identify_batch(turn_embs_arr)
 
-            # Emotion prediction conditioned on fixed window
-            seg_wave_padded = preprocess_audio_window(seg_wave, target_samples=TARGET_SAMPLES)
-            seg_spec = compute_log_mel_spectrogram(seg_wave_padded)
-            seg_tensor = torch.from_numpy(seg_spec).unsqueeze(0).unsqueeze(0).float().to(self.device)
+            # 2. Batched Emotion Recognition across all speech turns in a single vectorized forward pass
+            padded_turns = [preprocess_audio_window(w, target_samples=TARGET_SAMPLES) for w in seg_waves]
+            turn_specs = [compute_log_mel_spectrogram(w) for w in padded_turns]
+            batch_emo_tensor = torch.from_numpy(np.stack(turn_specs, axis=0)).unsqueeze(1).float().to(self.device)
+
             with torch.no_grad():
-                emo_logits = self.emotion_model(seg_tensor)
-                emo_probs = torch.softmax(emo_logits, dim=-1)[0].cpu().numpy()
-                top_emo_idx = int(np.argmax(emo_probs))
-                emotion_label = EMOTIONS[top_emo_idx]
-                emotion_conf = float(emo_probs[top_emo_idx])
+                emo_logits = self.emotion_model(batch_emo_tensor)
+                emo_probs = torch.softmax(emo_logits, dim=-1).cpu().numpy()
 
-            turns_analysis.append({
-                "time_range": f"{seg.start:.2f}s - {seg.end:.2f}s",
-                "cluster_speaker": seg.speaker,
-                "identified_speaker": identified_spk,
-                "speaker_confidence": round(spk_conf, 3),
-                "emotion": emotion_label,
-                "emotion_confidence": round(emotion_conf, 3),
-            })
+            for i, seg in enumerate(valid_segments):
+                identified_spk, spk_conf = id_results[i]
+                probs_i = emo_probs[i]
+                top_emo_idx = int(np.argmax(probs_i))
+                turns_analysis.append({
+                    "time_range": f"{seg.start:.2f}s - {seg.end:.2f}s",
+                    "cluster_speaker": seg.speaker,
+                    "identified_speaker": identified_spk,
+                    "speaker_confidence": round(spk_conf, 3),
+                    "emotion": EMOTIONS[top_emo_idx],
+                    "emotion_confidence": round(float(probs_i[top_emo_idx]), 3),
+                })
 
         result = {
+
             "file_name": file_name,
             "duration": f"{true_duration:.2f}s",
             "model_provenance": {

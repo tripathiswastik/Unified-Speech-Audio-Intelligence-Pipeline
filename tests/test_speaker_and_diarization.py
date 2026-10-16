@@ -93,3 +93,30 @@ def test_diarization_short_audio_handling():
     assert abs(segments[0].end - 0.8) < 0.05
 
 
+def test_speaker_identifier_embedding_reuse_and_batch():
+    """Verify identifying directly from precomputed embeddings and batch identification."""
+    identifier = SpeakerIdentifier()
+    emb_alice = np.zeros(128, dtype=np.float32)
+    emb_alice[0] = 1.0
+    emb_bob = np.zeros(128, dtype=np.float32)
+    emb_bob[1] = 1.0
+
+    identifier.enrolled_profiles["Alice"] = emb_alice
+    identifier.enrolled_profiles["Bob"] = emb_bob
+    identifier._update_enrolled_matrix()
+
+    # Query using direct precomputed embedding
+    spk, sim = identifier.identify(embedding=emb_alice, threshold=0.5)
+    assert spk == "Alice"
+    assert abs(sim - 1.0) < 1e-5
+
+    # Query using batch of embeddings
+    query_batch = np.stack([emb_alice, emb_bob, np.zeros(128, dtype=np.float32)], axis=0)
+    batch_results = identifier.identify_batch(query_batch, threshold=0.5)
+    assert len(batch_results) == 3
+    assert batch_results[0][0] == "Alice"
+    assert batch_results[1][0] == "Bob"
+    assert "Unenrolled" in batch_results[2][0]
+
+
+

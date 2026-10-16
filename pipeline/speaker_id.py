@@ -122,12 +122,26 @@ class SpeakerIdentifier:
             self.enrolled_profiles[speaker_name] = emb.astype(np.float32)
         self._update_enrolled_matrix()
 
-    def identify(self, waveform: np.ndarray, threshold: float = 0.5) -> Tuple[str, float]:
-        """Identify which enrolled speaker matches the waveform using vectorized matrix search."""
+    def identify(
+        self,
+        waveform: Optional[np.ndarray] = None,
+        threshold: float = 0.5,
+        embedding: Optional[np.ndarray] = None,
+    ) -> Tuple[str, float]:
+        """Identify which enrolled speaker matches using vectorized matrix search.
+
+        Supports passing either raw audio waveform or precomputed 128-d voiceprint embedding.
+        """
         if not self.enrolled_profiles or self._enrolled_matrix is None:
             return "Unknown_Speaker", 0.0
 
-        query_emb = self.extract_embedding(waveform)
+        if embedding is not None:
+            query_emb = embedding
+        elif waveform is not None:
+            query_emb = self.extract_embedding(waveform)
+        else:
+            return "Unknown_Speaker", 0.0
+
         # Vectorized dot product against all enrolled profiles in one operation
         sims = np.dot(self._enrolled_matrix, query_emb)
         best_idx = int(np.argmax(sims))
@@ -138,3 +152,29 @@ class SpeakerIdentifier:
             return f"Unenrolled ({best_speaker} dist: {best_sim:.2f})", best_sim
 
         return best_speaker, best_sim
+
+    def identify_batch(
+        self,
+        embeddings: np.ndarray,
+        threshold: float = 0.5,
+    ) -> List[Tuple[str, float]]:
+        """Identify multiple speakers simultaneously from precomputed (N, 128) embeddings in a single GEMM."""
+        if len(embeddings) == 0:
+            return []
+        if not self.enrolled_profiles or self._enrolled_matrix is None:
+            return [("Unknown_Speaker", 0.0) for _ in range(len(embeddings))]
+
+        # (N, num_enrolled) = (N, 128) @ (128, num_enrolled)
+        sim_matrix = np.dot(embeddings, self._enrolled_matrix.T)
+        results = []
+        for i in range(len(embeddings)):
+            sims = sim_matrix[i]
+            best_idx = int(np.argmax(sims))
+            best_sim = float(sims[best_idx])
+            best_speaker = self._enrolled_names[best_idx]
+            if best_sim < threshold:
+                results.append((f"Unenrolled ({best_speaker} dist: {best_sim:.2f})", best_sim))
+            else:
+                results.append((best_speaker, best_sim))
+        return results
+
