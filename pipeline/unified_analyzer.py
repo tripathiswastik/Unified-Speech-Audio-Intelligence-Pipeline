@@ -11,7 +11,7 @@ import numpy as np
 import torch
 import soundfile as sf
 
-from pipeline.config import CHECKPOINTS_DIR, CLASSES, ID_TO_CLASS, SAMPLE_RATE
+from pipeline.config import BASE_DIR, CHECKPOINTS_DIR, CLASSES, ID_TO_CLASS, SAMPLE_RATE
 from pipeline.audio_loader import load_and_preprocess_audio, compute_log_mel_spectrogram
 from pipeline.model import AudioCNN
 from pipeline.emotion_model import EmotionClassifierCNN
