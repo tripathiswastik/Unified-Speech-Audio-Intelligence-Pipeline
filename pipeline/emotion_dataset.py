@@ -5,7 +5,7 @@ Implements Strict Speaker-Independent Disjoint Splits:
   - Independent Test: Actors 21-24 (16.7% strictly held-out for unbiased benchmarking)
 """
 from pathlib import Path
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union, Any, overload
 import pandas as pd
 import numpy as np
 import torch
@@ -75,14 +75,39 @@ class EmotionDataset(Dataset):
         return spec_tensor, label, applied_noise
 
 
+@overload
 def get_emotion_dataloaders(
-    train_actors: List[int] = list(range(1, 19)),  # Actors 1-18 (train)
-    val_actors: List[int] = [19, 20],              # Actors 19-20 (checkpoint selection)
-    test_actors: Optional[List[int]] = None,       # Actors 21-24 (independent benchmark)
+    train_actors: List[int] = ...,
+    val_actors: List[int] = ...,
+    test_actors: None = None,
     batch_size: int = 32,
     use_noise_augmentation: bool = True,
-) -> Union[Tuple[DataLoader, DataLoader], Tuple[DataLoader, DataLoader, DataLoader]]:
+) -> Tuple[DataLoader, DataLoader]: ...
+
+
+@overload
+def get_emotion_dataloaders(
+    train_actors: List[int],
+    val_actors: List[int],
+    test_actors: List[int],
+    batch_size: int = 32,
+    use_noise_augmentation: bool = True,
+) -> Tuple[DataLoader, DataLoader, DataLoader]: ...
+
+
+def get_emotion_dataloaders(
+    train_actors: Optional[List[int]] = None,
+    val_actors: Optional[List[int]] = None,
+    test_actors: Optional[List[int]] = None,
+    batch_size: int = 32,
+    use_noise_augmentation: bool = True,
+) -> Any:
     """Create speaker-independent train, validation, and optional test DataLoaders."""
+    if train_actors is None:
+        train_actors = list(range(1, 19))
+    if val_actors is None:
+        val_actors = [19, 20]
+
     noise_mixer = UrbanNoiseMixer() if use_noise_augmentation else None
 
     train_ds = EmotionDataset(actors=train_actors, noise_mixer=noise_mixer)

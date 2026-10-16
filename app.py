@@ -67,11 +67,13 @@ def get_base_analyzer(demo_mode: bool) -> UnifiedAudioAnalyzer:
     return UnifiedAudioAnalyzer(strict_checkpoints=not demo_mode, demo_mode=demo_mode)
 
 
+analyzer: Optional[UnifiedAudioAnalyzer] = None
+analyzer_ready = False
+
 try:
     analyzer = get_base_analyzer(demo_mode=allow_demo)
     analyzer_ready = True
 except FileNotFoundError as e:
-    analyzer_ready = False
     st.sidebar.error(f"⚠️ Checkpoint Guard Error: {e}")
 
 # Maintain session-isolated speaker enrollments
@@ -86,14 +88,14 @@ if "session_enrolled_speakers" not in st.session_state:
                 if wavs:
                     try:
                         wave, _ = load_full_audio(wavs[0])
-                        if analyzer_ready:
+                        if analyzer_ready and analyzer is not None:
                             emb = analyzer.speaker_identifier.extract_embedding(wave)
                             st.session_state["session_enrolled_speakers"][f"Speaker_{spk_id}"] = emb
                     except Exception:
                         pass
 
 # Synchronize session enrollments with analyzer's identifier
-if analyzer_ready:
+if analyzer_ready and analyzer is not None:
     analyzer.speaker_identifier.enrolled_profiles = dict(st.session_state["session_enrolled_speakers"])
 
 
@@ -109,7 +111,7 @@ st.sidebar.markdown("---")
 
 # Sidebar: Checkpoint Integrity & Provenance
 st.sidebar.header("🧠 Model Checkpoints")
-if analyzer_ready:
+if analyzer_ready and analyzer is not None:
     if analyzer.urban_checkpoint_loaded:
         sha = f" (`{analyzer.urban_checkpoint_sha256}`)" if analyzer.urban_checkpoint_sha256 else ""
         st.sidebar.markdown(f"🟢 **UrbanSound8K:** Trained{sha}")
@@ -129,6 +131,7 @@ if analyzer_ready:
         st.sidebar.warning("⚠️ **Speaker ID:** Untrained (Random Weights)")
 else:
     st.sidebar.error("❌ Models halted due to missing checkpoints. Enable 'Synthetic Demo Mode' above to proceed.")
+
 
 st.sidebar.markdown("---")
 
@@ -254,9 +257,9 @@ with tab_pipeline:
                     unsafe_allow_html=True,
                 )
 
-            if not analyzer_ready and not allow_demo:
+            if (not analyzer_ready or analyzer is None) and not allow_demo:
                 st.warning("Cannot run analysis: Required model checkpoints are missing. Train checkpoints or enable 'Synthetic Demo Mode' in the sidebar.")
-            else:
+            elif analyzer is not None:
                 if st.button("🚀 Run Multi-Task Audio Intelligence Pipeline", type="primary", key="pipeline_run_btn"):
                     device_str = "GPU (CUDA)" if torch.cuda.is_available() else "CPU"
                     with st.spinner(f"Executing neural multi-task inference on {device_str}..."):
@@ -372,7 +375,7 @@ with tab_speaker_studio:
                 st.error("Speaker label must contain valid alphanumeric characters (a-z, A-Z, 0-9, _, -).")
             elif enroll_upload is None:
                 st.error("Please upload an audio file to extract reference voiceprint.")
-            elif not analyzer_ready:
+            elif not analyzer_ready or analyzer is None:
                 st.error("Speaker embedding model not loaded. Enable Synthetic Demo Mode or train checkpoint.")
             else:
                 with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_enroll:
@@ -416,7 +419,7 @@ with tab_speaker_studio:
         threshold = st.slider("Cosine Verification Threshold", min_value=0.20, max_value=0.90, value=0.60, step=0.05, key="verify_thresh")
 
         if st.button("🔬 Compute Pairwise Verification", type="primary", key="verify_btn") and vox_files and idx_a is not None and idx_b is not None:
-            if not analyzer_ready:
+            if not analyzer_ready or analyzer is None:
                 st.error("Model checkpoints unavailable. Enable Synthetic Demo Mode or train checkpoint.")
             else:
                 file_a = vox_files[idx_a]

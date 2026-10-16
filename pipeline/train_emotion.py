@@ -72,10 +72,10 @@ def run_emotion_training(
     print(f" Epochs: {epochs} | Batch Size: {batch_size}")
     print(f"=======================================================\n")
 
-    CHECKPOINTS_DIR.mkdir(parents=True, exist_ok=True)
-    train_loader, val_loader = get_emotion_dataloaders(
+    dataloaders = get_emotion_dataloaders(
         batch_size=batch_size, use_noise_augmentation=use_noise_aug
     )
+    train_loader, val_loader = dataloaders[0], dataloaders[1]
 
     model = EmotionClassifierCNN().to(device)
     criterion = nn.CrossEntropyLoss()
