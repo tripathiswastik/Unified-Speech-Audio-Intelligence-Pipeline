@@ -139,6 +139,70 @@ else:
     st.sidebar.error("❌ Models halted due to missing checkpoints. Enable 'Synthetic Demo Mode' above to proceed.")
 
 
+def save_uploaded_to_temp(uploaded_file, session_key_prefix: str) -> Path:
+    """Save an uploaded file to a persistent session temp file and return its Path."""
+    path_key = f"{session_key_prefix}_path"
+    name_key = f"{session_key_prefix}_name"
+    existing_path = st.session_state.get(path_key)
+    if existing_path and Path(existing_path).exists() and st.session_state.get(name_key) == uploaded_file.name:
+        return Path(existing_path)
+
+    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    tmp.write(uploaded_file.getbuffer())
+    tmp.close()
+    saved_path = Path(tmp.name)
+    st.session_state[path_key] = saved_path
+    st.session_state[name_key] = uploaded_file.name
+    return saved_path
+
+
+# Sidebar: Audio Input Source (Shared across all tabs)
+st.sidebar.header("📁 Audio Input Source")
+input_mode = st.sidebar.radio("Choose Input Mode", ["Curated Dataset Samples", "Upload Custom WAV"], key="pipeline_input_mode")
+
+selected_file: Optional[Path] = None
+global_custom_file: Optional[Path] = None
+global_custom_name: Optional[str] = None
+
+if input_mode == "Curated Dataset Samples":
+    category = st.sidebar.selectbox(
+        "Dataset Category",
+        ["RAVDESS Speech Emotion (wo/)", "UrbanSound8K Background Sound", "VoxCeleb Speaker (wav/)"],
+        key="pipeline_category",
+    )
+    if category is not None and "RAVDESS" in category:
+        root_dir = BASE_DIR / "wo" / "Audio_Speech_Actors_01-24"
+        files = list(root_dir.glob("Actor_*/*.wav"))[:25]
+    elif category is not None and "UrbanSound" in category:
+        root_dir = AUDIO_DIR
+        files = list(root_dir.glob("fold1/*.wav"))[:25]
+    else:
+        root_dir = BASE_DIR / "wav"
+        files = list(root_dir.glob("id10001/*/*.wav"))[:25]
+
+    file_names = [f"{f.parent.name}/{f.name}" for f in files]
+    idx = st.sidebar.selectbox("Select File", range(len(file_names)), format_func=lambda i: file_names[i], key="pipeline_file_idx")
+    if files and idx is not None:
+        selected_file = files[idx]
+else:
+    uploaded = st.sidebar.file_uploader("Upload .wav file (Max 25MB)", type=["wav"], key="pipeline_upload")
+    if uploaded is not None:
+        if uploaded.size > 25 * 1024 * 1024:
+            st.sidebar.error("Uploaded file exceeds maximum limit of 25MB.")
+        else:
+            selected_file = save_uploaded_to_temp(uploaded, "global_custom_audio")
+            global_custom_file = selected_file
+            global_custom_name = uploaded.name
+
+# Recover existing global custom upload from session state if available
+if global_custom_file is None and "global_custom_audio_path" in st.session_state:
+    persisted_path = Path(st.session_state["global_custom_audio_path"])
+    if persisted_path.exists():
+        global_custom_file = persisted_path
+        global_custom_name = st.session_state.get("global_custom_audio_name")
+        if selected_file is None and input_mode == "Upload Custom WAV":
+            selected_file = global_custom_file
+
 st.sidebar.markdown("---")
 
 # Main Navigation Tabs
@@ -154,49 +218,8 @@ tab_pipeline, tab_speaker_studio, tab_metrics, tab_streaming = st.tabs([
 # TAB 1: MULTI-TASK AUDIO INTELLIGENCE PIPELINE
 # ==============================================================================
 with tab_pipeline:
-    st.sidebar.header("📁 Audio Input Source")
-    input_mode = st.sidebar.radio("Choose Input Mode", ["Curated Dataset Samples", "Upload Custom WAV"], key="pipeline_input_mode")
-
-    selected_file: Optional[Path] = None
-    is_temp_upload = False
-
-    if input_mode == "Curated Dataset Samples":
-        category = st.sidebar.selectbox(
-            "Dataset Category",
-            ["RAVDESS Speech Emotion (wo/)", "UrbanSound8K Background Sound", "VoxCeleb Speaker (wav/)"],
-            key="pipeline_category",
-        )
-        if category is not None and "RAVDESS" in category:
-            root_dir = BASE_DIR / "wo" / "Audio_Speech_Actors_01-24"
-            files = list(root_dir.glob("Actor_*/*.wav"))[:25]
-        elif category is not None and "UrbanSound" in category:
-            root_dir = AUDIO_DIR
-            files = list(root_dir.glob("fold1/*.wav"))[:25]
-        else:
-            root_dir = BASE_DIR / "wav"
-            files = list(root_dir.glob("id10001/*/*.wav"))[:25]
-
-        file_names = [f"{f.parent.name}/{f.name}" for f in files]
-        idx = st.sidebar.selectbox("Select File", range(len(file_names)), format_func=lambda i: file_names[i], key="pipeline_file_idx")
-        if files and idx is not None:
-            selected_file = files[idx]
-    else:
-        uploaded = st.sidebar.file_uploader("Upload .wav file (Max 25MB)", type=["wav"], key="pipeline_upload")
-        if uploaded is not None:
-            # File size check
-            if uploaded.size > 25 * 1024 * 1024:
-                st.sidebar.error("Uploaded file exceeds maximum limit of 25MB.")
-            else:
-                # Write to unique secure temporary file
-                temp_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-                temp_file.write(uploaded.getbuffer())
-                temp_file.close()
-                selected_file = Path(temp_file.name)
-                is_temp_upload = True
-
     # Noise Injection Settings
-    st.sidebar.markdown("---")
-    st.sidebar.header("🔊 UrbanSound8K Noise Injection")
+    st.sidebar.header("🔊 Noise Injection")
     inject_noise = st.sidebar.checkbox("Simulate Real-World Urban Noise", value=False, key="pipeline_inject_noise")
     noise_class = None
     target_snr = 10.0
@@ -209,7 +232,9 @@ with tab_pipeline:
     num_speakers = st.sidebar.number_input("Expected Speakers (0 = Auto-Estimate)", min_value=0, max_value=8, value=2, key="pipeline_num_spk")
 
     # Main Tab Display
-    if selected_file and selected_file.exists():
+    if not (selected_file and selected_file.exists()):
+        st.info("👈 Please select a curated sample or upload a custom .wav file in the sidebar to begin analysis.")
+    else:
         try:
             waveform, audio_dur = load_full_audio(selected_file)
         except Exception as e:
@@ -319,14 +344,7 @@ with tab_pipeline:
                         with st.expander("📄 View Full JSON Ruflo Provenance Report"):
                             st.json(report)
 
-        # Cleanup uploaded temporary audio if one was created
-        if is_temp_upload and selected_file and selected_file.exists():
-            try:
-                os.unlink(selected_file)
-            except Exception:
-                pass
-    else:
-        st.info("Please select or upload an audio file from the left sidebar to begin.")
+
 
 
 # ==============================================================================
@@ -364,22 +382,33 @@ with tab_speaker_studio:
 
         st.markdown("#### ➕ Enroll New Speaker")
         new_spk_name = st.text_input("Speaker Label (Alphanumeric)", value="Speaker_Custom", key="new_spk_name")
-        enroll_upload = st.file_uploader("Upload Reference Audio (.wav, Max 25MB)", type=["wav"], key="enroll_upload")
+        
+        enroll_opts = ["⬆️ Upload Reference WAV"]
+        if global_custom_file and global_custom_file.exists():
+            enroll_opts.insert(0, f"📁 Use Sidebar Upload ({global_custom_name})")
+        
+        enroll_choice = st.radio("Reference Audio Source", enroll_opts, key="enroll_src_radio")
+        enroll_path: Optional[Path] = None
+        
+        if enroll_choice.startswith("📁 Use Sidebar Upload"):
+            enroll_path = global_custom_file
+            st.caption(f"Using `{global_custom_name}` for voiceprint registration.")
+        else:
+            enroll_upload = st.file_uploader("Upload Reference Audio (.wav, Max 25MB)", type=["wav"], key="enroll_upload")
+            if enroll_upload is not None:
+                enroll_path = save_uploaded_to_temp(enroll_upload, "enroll_audio")
 
         if st.button("Enroll Voiceprint into Registry", key="enroll_btn"):
             sanitized_name = re.sub(r"[^a-zA-Z0-9_\-]", "", new_spk_name.strip())
             if not sanitized_name:
                 st.error("Speaker label must contain valid alphanumeric characters (a-z, A-Z, 0-9, _, -).")
-            elif enroll_upload is None:
-                st.error("Please upload an audio file to extract reference voiceprint.")
+            elif enroll_path is None or not enroll_path.exists():
+                st.error("Please provide a valid audio file to extract reference voiceprint.")
             elif not analyzer_ready or analyzer is None:
                 st.error("Speaker embedding model not loaded. Enable Synthetic Demo Mode or train checkpoint.")
             else:
-                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_enroll:
-                    tmp_enroll.write(enroll_upload.getbuffer())
-                    tmp_path = Path(tmp_enroll.name)
                 try:
-                    ref_wave, _ = load_full_audio(tmp_path)
+                    ref_wave, _ = load_full_audio(enroll_path)
                     emb = analyzer.speaker_identifier.extract_embedding(ref_wave)
                     st.session_state["session_enrolled_speakers"][sanitized_name] = emb
                     st.success(f"✅ Successfully enrolled voiceprint for **{sanitized_name}** in session!")
@@ -389,12 +418,6 @@ with tab_speaker_studio:
                         getattr(st, "experimental_rerun")()
                 except Exception as e:
                     st.error(f"Error during enrollment: {e}")
-                finally:
-                    if tmp_path.exists():
-                        try:
-                            os.unlink(tmp_path)
-                        except Exception:
-                            pass
 
     # Section B: Pairwise 1-to-1 Voiceprint Verification
     with studio_col2:
@@ -405,23 +428,69 @@ with tab_speaker_studio:
         vox_files = list(vox_root.glob("*/*/*.wav"))[:40] if vox_root.exists() else []
         vox_labels = [f"{f.parent.parent.name}/{f.name}" for f in vox_files]
 
+        # Available source choices for Sample A and Sample B
+        src_choices = ["Curated VoxCeleb"]
+        if global_custom_file and global_custom_file.exists():
+            src_choices.append(f"📁 Sidebar Upload ({global_custom_name})")
+        src_choices.append("⬆️ Upload Custom WAV")
+
         c_v1, c_v2 = st.columns(2)
         with c_v1:
             st.markdown("**Voice Sample A**")
-            idx_a = st.selectbox("Sample A", range(len(vox_labels)), format_func=lambda i: vox_labels[i], index=0 if len(vox_labels) > 0 else 0, key="v_sample_a")
+            opt_a = st.selectbox("Sample A Source", src_choices, key="src_a_select")
+            file_a: Optional[Path] = None
+            label_a: str = "Sample A"
+
+            if opt_a.startswith("📁 Sidebar Upload"):
+                file_a = global_custom_file
+                label_a = global_custom_name or "Custom Audio A"
+            elif opt_a == "⬆️ Upload Custom WAV":
+                up_a = st.file_uploader("Upload Sample A (.wav)", type=["wav"], key="upload_custom_sample_a")
+                if up_a is not None:
+                    file_a = save_uploaded_to_temp(up_a, "verify_sample_a")
+                    label_a = up_a.name
+            else:
+                if vox_labels:
+                    idx_a = st.selectbox("Select Sample A", range(len(vox_labels)), format_func=lambda i: vox_labels[i], index=0, key="v_sample_a")
+                    if idx_a is not None:
+                        file_a = vox_files[idx_a]
+                        label_a = vox_labels[idx_a]
+
+            if file_a and file_a.exists():
+                st.audio(str(file_a))
+
         with c_v2:
             st.markdown("**Voice Sample B**")
-            idx_b = st.selectbox("Sample B", range(len(vox_labels)), format_func=lambda i: vox_labels[i], index=min(1, len(vox_labels)-1) if len(vox_labels) > 1 else 0, key="v_sample_b")
+            opt_b = st.selectbox("Sample B Source", src_choices, index=min(1, len(src_choices)-1), key="src_b_select")
+            file_b: Optional[Path] = None
+            label_b: str = "Sample B"
+
+            if opt_b.startswith("📁 Sidebar Upload"):
+                file_b = global_custom_file
+                label_b = global_custom_name or "Custom Audio B"
+            elif opt_b == "⬆️ Upload Custom WAV":
+                up_b = st.file_uploader("Upload Sample B (.wav)", type=["wav"], key="upload_custom_sample_b")
+                if up_b is not None:
+                    file_b = save_uploaded_to_temp(up_b, "verify_sample_b")
+                    label_b = up_b.name
+            else:
+                if vox_labels:
+                    idx_b = st.selectbox("Select Sample B", range(len(vox_labels)), format_func=lambda i: vox_labels[i], index=min(1, len(vox_labels)-1) if len(vox_labels) > 1 else 0, key="v_sample_b")
+                    if idx_b is not None:
+                        file_b = vox_files[idx_b]
+                        label_b = vox_labels[idx_b]
+
+            if file_b and file_b.exists():
+                st.audio(str(file_b))
 
         threshold = st.slider("Cosine Verification Threshold", min_value=0.20, max_value=0.90, value=0.60, step=0.05, key="verify_thresh")
 
-        if st.button("🔬 Compute Pairwise Verification", type="primary", key="verify_btn") and vox_files and idx_a is not None and idx_b is not None:
+        if st.button("🔬 Compute Pairwise Verification", type="primary", key="verify_btn"):
             if not analyzer_ready or analyzer is None:
                 st.error("Model checkpoints unavailable. Enable Synthetic Demo Mode or train checkpoint.")
+            elif not file_a or not file_b or not file_a.exists() or not file_b.exists():
+                st.warning("Please provide or select valid audio files for both Sample A and Sample B.")
             else:
-                file_a = vox_files[idx_a]
-                file_b = vox_files[idx_b]
-
                 wav_a, _ = load_full_audio(file_a)
                 wav_b, _ = load_full_audio(file_b)
 
@@ -463,10 +532,10 @@ with tab_speaker_studio:
                 spec_a = compute_log_mel_spectrogram(wav_a)
                 spec_b = compute_log_mel_spectrogram(wav_b)
                 ax_a.imshow(spec_a, aspect="auto", origin="lower", cmap="magma")
-                ax_a.set_title(f"Sample A: {file_a.parent.parent.name}")
+                ax_a.set_title(f"Sample A: {label_a}")
                 ax_a.set_xlabel("Time Frames")
                 ax_b.imshow(spec_b, aspect="auto", origin="lower", cmap="magma")
-                ax_b.set_title(f"Sample B: {file_b.parent.parent.name}")
+                ax_b.set_title(f"Sample B: {label_b}")
                 ax_b.set_xlabel("Time Frames")
                 plt.tight_layout()
                 st.pyplot(fig_cmp)
@@ -716,24 +785,45 @@ with tab_streaming:
         chunk_ms = st.slider("Ingestion Chunk Size (ms)", min_value=100, max_value=1000, value=250, step=50, key="streaming_chunk_ms")
         sim_energy_thresh = st.slider("RMS Energy VAD Threshold", min_value=0.005, max_value=0.10, value=0.015, step=0.005, key="sim_vad_thresh")
 
+        stream_opts = []
+        if global_custom_file and global_custom_file.exists():
+            stream_opts.append(f"📁 Sidebar Upload ({global_custom_name})")
+        stream_opts.append("⬆️ Upload Custom WAV for Streaming")
+        stream_opts.append("Curated VoxCeleb Sample")
+        stream_opts.append("Curated RAVDESS Speech Sample")
+
         sample_choice = st.selectbox(
             "Audio Stream Source",
-            ["Curated VoxCeleb Sample", "Curated RAVDESS Speech Sample"],
+            stream_opts,
             key="stream_src_select"
         )
 
-        stream_audio_path = None
-        if sample_choice == "Curated VoxCeleb Sample":
+        stream_audio_path: Optional[Path] = None
+        stream_label = "Audio Stream"
+        if sample_choice.startswith("📁 Sidebar Upload"):
+            stream_audio_path = global_custom_file
+            stream_label = global_custom_name or "Custom Audio"
+        elif sample_choice == "⬆️ Upload Custom WAV for Streaming":
+            stream_upload = st.file_uploader("Upload .wav file to stream (Max 25MB)", type=["wav"], key="direct_stream_upload")
+            if stream_upload is not None:
+                stream_audio_path = save_uploaded_to_temp(stream_upload, "stream_direct")
+                stream_label = stream_upload.name
+        elif sample_choice == "Curated VoxCeleb Sample":
             v_files = list((BASE_DIR / "wav").glob("id10001/*/*.wav"))
             if v_files:
                 stream_audio_path = v_files[0]
+                stream_label = v_files[0].name
         else:
             r_files = list((BASE_DIR / "wo" / "Audio_Speech_Actors_01-24").glob("Actor_*/*.wav"))
             if r_files:
                 stream_audio_path = r_files[0]
+                stream_label = r_files[0].name
 
         if stream_audio_path and stream_audio_path.exists():
             st.audio(str(stream_audio_path))
+            st.caption(f"Active Stream: `{stream_label}`")
+        else:
+            st.info("Please select or upload a WAV file to simulate streaming ingestion.")
 
         if st.button("▶️ Launch Stream Ingestion Simulation", key="btn_run_streaming"):
             if stream_audio_path and stream_audio_path.exists():
