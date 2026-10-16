@@ -1,8 +1,10 @@
-"""Audio Loader & Preprocessor for UrbanSound8K.
+"""Audio Loader & Preprocessor for UrbanSound8K and Continuous Speech Pipelines.
 Handles 24-bit PCM, WAVE_FORMAT_EXTENSIBLE, multi-channel, and variable sample rates.
+Provides both full-length audio loading for diarization/conversations and fixed-window
+preprocessing for convolutional classification networks.
 """
 from pathlib import Path
-from typing import Tuple, Dict
+from typing import Tuple, Dict, Optional
 import numpy as np
 import soundfile as sf
 import librosa
@@ -10,14 +12,23 @@ import librosa
 from pipeline.config import SAMPLE_RATE, TARGET_SAMPLES, N_MELS, N_FFT, HOP_LENGTH
 
 
-def load_and_preprocess_audio(file_path: Path, target_sr: int = SAMPLE_RATE) -> np.ndarray:
-    """Load an audio file, convert to mono, resample, and pad/crop to fixed length."""
+def load_full_audio(
+    file_path: Path, target_sr: int = SAMPLE_RATE
+) -> Tuple[np.ndarray, float]:
+    """Load an audio file in its entirety, convert to mono, resample, and normalize.
+    
+    Does NOT truncate or pad to fixed length, preserving full continuous duration
+    and absolute timestamps for multi-speaker diarization and conversational analysis.
+
+    Returns:
+        Tuple of (waveform: np.ndarray [float32], duration_seconds: float)
+    """
     file_str = str(file_path)
     try:
-        # soundfile is preferred for fast C-level reading and 24-bit/extensible format support
+        # Fast C-level reading with soundfile (supports 24-bit, extensible PCM)
         waveform, sr = sf.read(file_str, dtype="float32")
     except Exception:
-        # Fallback to librosa if soundfile encounters an atypical header
+        # Fallback to librosa if soundfile encounters an atypical container/codec
         waveform, sr = librosa.load(file_str, sr=None, mono=False)
 
     # Convert to mono if multi-channel (samples, channels) or (channels, samples)
@@ -27,63 +38,80 @@ def load_and_preprocess_audio(file_path: Path, target_sr: int = SAMPLE_RATE) -> 
         else:
             waveform = np.mean(waveform, axis=1)
 
-    # Pre-crop if duration exceeds 4.0s before resampling to save CPU cycles
-    max_raw_samples = int(4.0 * sr)
-    if len(waveform) > max_raw_samples:
-        start = (len(waveform) - max_raw_samples) // 2
-        waveform = waveform[start : start + max_raw_samples]
-
-    # Resample if sample rate doesn't match target using high-speed soxr_fast
+    # Resample if sample rate doesn't match target_sr
     if sr != target_sr:
         try:
             waveform = librosa.resample(waveform, orig_sr=sr, target_sr=target_sr, res_type="soxr_fast")
         except Exception:
             waveform = librosa.resample(waveform, orig_sr=sr, target_sr=target_sr)
 
-    # Standardize length to exactly TARGET_SAMPLES (4.0s at target_sr)
-    num_samples = len(waveform)
-    if num_samples < TARGET_SAMPLES:
-        pad_width = TARGET_SAMPLES - num_samples
-        waveform = np.pad(waveform, (0, pad_width), mode="constant")
-    elif num_samples > TARGET_SAMPLES:
-        start = (num_samples - TARGET_SAMPLES) // 2
-        waveform = waveform[start : start + TARGET_SAMPLES]
-
     # Normalize amplitude to [-1.0, 1.0]
-    max_val = np.max(np.abs(waveform))
+    max_val = np.max(np.abs(waveform)) if len(waveform) > 0 else 0.0
+    if max_val > 1e-6:
+        waveform = waveform / max_val
+
+    duration = float(len(waveform)) / float(target_sr)
+    return waveform.astype(np.float32), duration
+
+
+def preprocess_audio_window(
+    waveform: np.ndarray, target_samples: int = TARGET_SAMPLES
+) -> np.ndarray:
+    """Pad or center-crop a 1D waveform to an exact target number of samples.
+    
+    Used strictly by fixed-input convolutional neural networks (e.g., UrbanSound8K
+    or fixed-window SER networks).
+    """
+    num_samples = len(waveform)
+    if num_samples < target_samples:
+        pad_width = target_samples - num_samples
+        waveform = np.pad(waveform, (0, pad_width), mode="constant")
+    elif num_samples > target_samples:
+        start = (num_samples - target_samples) // 2
+        waveform = waveform[start : start + target_samples]
+
+    max_val = np.max(np.abs(waveform)) if len(waveform) > 0 else 0.0
     if max_val > 1e-6:
         waveform = waveform / max_val
 
     return waveform.astype(np.float32)
 
 
+def load_and_preprocess_audio(
+    file_path: Path,
+    target_sr: int = SAMPLE_RATE,
+    target_samples: int = TARGET_SAMPLES,
+) -> np.ndarray:
+    """Load an audio file and format to fixed length (TARGET_SAMPLES).
+    
+    Provided for training pipelines and fixed-input evaluations.
+    """
+    waveform, _ = load_full_audio(file_path, target_sr=target_sr)
+    return preprocess_audio_window(waveform, target_samples=target_samples)
+
+
 _MEL_BASIS_CACHE: Dict[Tuple[int, int, int], np.ndarray] = {}
 
 
 def get_mel_filterbank(sr: int = SAMPLE_RATE, n_fft: int = N_FFT, n_mels: int = N_MELS) -> np.ndarray:
-    """Retrieve or precompute cached Mel filterbank basis to avoid per-call reallocations."""
+    """Retrieve or compute a cached static triangular Mel filterbank matrix."""
     key = (sr, n_fft, n_mels)
     if key not in _MEL_BASIS_CACHE:
         _MEL_BASIS_CACHE[key] = librosa.filters.mel(sr=sr, n_fft=n_fft, n_mels=n_mels)
     return _MEL_BASIS_CACHE[key]
 
 
-def compute_log_mel_spectrogram(
-    waveform: np.ndarray,
-    sr: int = SAMPLE_RATE,
-    n_mels: int = N_MELS,
-    n_fft: int = N_FFT,
-    hop_length: int = HOP_LENGTH,
-) -> np.ndarray:
-    """Convert standardized waveform to a normalized Log-Mel Spectrogram using precomputed filterbanks."""
-    mel_basis = get_mel_filterbank(sr=sr, n_fft=n_fft, n_mels=n_mels)
-    stft = librosa.stft(waveform, n_fft=n_fft, hop_length=hop_length)
-    power_spec = np.abs(stft) ** 2
-    mel_spec = np.dot(mel_basis, power_spec)
-    # Convert to power-to-db (Log-Mel)
+def compute_log_mel_spectrogram(waveform: np.ndarray, sr: int = SAMPLE_RATE) -> np.ndarray:
+    """Extract Log-Mel Spectrogram with reused Mel filterbank and standard normalization."""
+    mel_basis = get_mel_filterbank(sr, N_FFT, N_MELS)
+    stft = librosa.stft(waveform, n_fft=N_FFT, hop_length=HOP_LENGTH)
+    power = np.abs(stft) ** 2
+    mel_spec = np.dot(mel_basis, power)
     log_mel = librosa.power_to_db(mel_spec, ref=np.max)
-
-    # Normalize to [0, 1] range for stable neural network training
-    min_db = -80.0
-    norm_mel = (np.clip(log_mel, min_db, 0.0) - min_db) / (-min_db)
-    return norm_mel.astype(np.float32)
+    mean = np.mean(log_mel)
+    std = np.std(log_mel)
+    if std > 1e-6:
+        log_mel = (log_mel - mean) / std
+    else:
+        log_mel = log_mel - mean
+    return log_mel.astype(np.float32)

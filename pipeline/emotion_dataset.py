@@ -1,8 +1,11 @@
 """PyTorch Dataset for Speech Emotion Recognition (SER) with UrbanSound8K Noise Augmentation.
-Implements Speaker-Independent Splits (evaluates on unseen actors).
+Implements Strict Speaker-Independent Disjoint Splits:
+  - Train: Actors 1-18 (75%)
+  - Validation: Actors 19-20 (8.3% for checkpoint selection)
+  - Independent Test: Actors 21-24 (16.7% strictly held-out for unbiased benchmarking)
 """
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 import pandas as pd
 import numpy as np
 import torch
@@ -52,7 +55,7 @@ class EmotionDataset(Dataset):
         row = self.df.iloc[index]
         file_path = self.speech_root / row["relative_path"]
 
-        # Load clean speech
+        # Load clean speech (fixed 4s window for convolutional SER model)
         waveform = load_and_preprocess_audio(file_path)
         applied_noise = "none"
 
@@ -73,18 +76,24 @@ class EmotionDataset(Dataset):
 
 
 def get_emotion_dataloaders(
-    train_actors: List[int] = list(range(1, 21)),  # Actors 1-20 (train)
-    val_actors: List[int] = [21, 22, 23, 24],     # Actors 21-24 (unseen test actors)
+    train_actors: List[int] = list(range(1, 19)),  # Actors 1-18 (train)
+    val_actors: List[int] = [19, 20],              # Actors 19-20 (checkpoint selection)
+    test_actors: Optional[List[int]] = None,       # Actors 21-24 (independent benchmark)
     batch_size: int = 32,
     use_noise_augmentation: bool = True,
-) -> Tuple[DataLoader, DataLoader]:
-    """Create speaker-independent train and validation DataLoaders."""
+) -> Union[Tuple[DataLoader, DataLoader], Tuple[DataLoader, DataLoader, DataLoader]]:
+    """Create speaker-independent train, validation, and optional test DataLoaders."""
     noise_mixer = UrbanNoiseMixer() if use_noise_augmentation else None
 
     train_ds = EmotionDataset(actors=train_actors, noise_mixer=noise_mixer)
-    val_ds = EmotionDataset(actors=val_actors, noise_mixer=None)  # Clean benchmark for val
+    val_ds = EmotionDataset(actors=val_actors, noise_mixer=None)
 
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=True)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+
+    if test_actors is not None:
+        test_ds = EmotionDataset(actors=test_actors, noise_mixer=None)
+        test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False)
+        return train_loader, val_loader, test_loader
 
     return train_loader, val_loader

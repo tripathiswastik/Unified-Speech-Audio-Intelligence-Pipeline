@@ -45,4 +45,17 @@ def test_strict_checkpoint_failure_on_nonexistent(monkeypatch, tmp_path):
     monkeypatch.setattr(ua, "CHECKPOINTS_DIR", empty_dir)
 
     with pytest.raises(FileNotFoundError):
-        ua.UnifiedAudioAnalyzer(strict_checkpoints=True)
+        ua.UnifiedAudioAnalyzer(strict_checkpoints=True, demo_mode=False)
+
+
+def test_demo_mode_allows_missing_checkpoints(monkeypatch, tmp_path):
+    """Verify demo_mode=True allows instantiation even when checkpoints are missing."""
+    import pipeline.unified_analyzer as ua
+    empty_dir = tmp_path / "empty_checkpoints_demo"
+    empty_dir.mkdir()
+    monkeypatch.setattr(ua, "CHECKPOINTS_DIR", empty_dir)
+
+    analyzer = ua.UnifiedAudioAnalyzer(strict_checkpoints=True, demo_mode=True)
+    assert analyzer.demo_mode is True
+    assert analyzer.urban_checkpoint_loaded is False
+

@@ -31,13 +31,16 @@ jobs:
     - name: Install Python dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install -r requirements.txt
-        pip install pytest
+        python -m pip install -r requirements.txt
+        python -m pip install -e .
 
     - name: Run Environment Preflight Validation
       run: |
         python -m pipeline.validate_environment
 
     - name: Run Synthetic Unit Tests (CPU Mode)
+      env:
+        PYTHONPATH: ${{ github.workspace }}
       run: |
-        pytest tests/ -v
+        python -m pytest tests/ -v
+

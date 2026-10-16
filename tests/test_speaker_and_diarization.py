@@ -55,3 +55,13 @@ def test_batched_diarization():
             assert s.start < s.end
             assert s.speaker.startswith("Speaker_")
             assert s.embedding.shape == (128,)
+
+
+def test_auto_speaker_count_diarization():
+    """Verify diarizer can automatically estimate speaker count when num_speakers=None."""
+    diarizer = SpeakerDiarizer(window_size_sec=1.0, hop_size_sec=0.5, vad_energy_threshold=0.001)
+    # 6 seconds of synthetic audio
+    wave = np.random.randn(int(SAMPLE_RATE * 6.0)).astype(np.float32)
+    segments = diarizer.diarize(wave, num_speakers=None)
+    assert isinstance(segments, list)
+

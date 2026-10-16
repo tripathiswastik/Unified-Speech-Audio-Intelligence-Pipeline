@@ -1,14 +1,17 @@
 """Interactive Streamlit Dashboard for UrbanSound8K Speech & Audio Intelligence.
 Integrates:
-  - Environmental Sound Recognition (UrbanSound8K 10-Fold Ensemble)
+  - Continuous Environmental Sound Recognition (UrbanSound8K Multi-Window Ensemble)
   - Real-World Urban Noise Injection (SNR controls)
-  - Speaker Diarization ('Who spoke when?')
+  - Speaker Diarization ('Who spoke when?') with VAD Hangover Smoothing
   - Speaker Identification & Verification (VoxCeleb Voiceprints)
   - Speech Emotion Recognition (RAVDESS 8 emotions)
   - Experiment Tracking & Ruflo Cross-Validation Analytics
 """
 import io
+import os
+import re
 import json
+import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional
 import streamlit as st
@@ -18,7 +21,7 @@ import soundfile as sf
 import torch
 
 from pipeline.config import BASE_DIR, AUDIO_DIR, SAMPLE_RATE, CLASSES
-from pipeline.audio_loader import load_and_preprocess_audio, compute_log_mel_spectrogram
+from pipeline.audio_loader import load_full_audio, compute_log_mel_spectrogram
 from pipeline.urban_noise_mixer import UrbanNoiseMixer
 from pipeline.unified_analyzer import UnifiedAudioAnalyzer
 from pipeline.device import get_device
@@ -39,6 +42,7 @@ st.markdown(
     .metric-card { background: #f8f9fa; border-radius: 8px; padding: 15px; border-left: 4px solid #1E88E5; }
     .verdict-match { background-color: #E8F5E9; border-left: 5px solid #2E7D32; padding: 12px 18px; border-radius: 6px; }
     .verdict-diff { background-color: #FFEBEE; border-left: 5px solid #C62828; padding: 12px 18px; border-radius: 6px; }
+    .demo-banner { background-color: #FFF3E0; border-left: 5px solid #F57C00; padding: 10px 16px; border-radius: 6px; margin-bottom: 12px; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -48,10 +52,31 @@ st.markdown('<div class="main-title">🎙️ UrbanSound8K Speech & Audio Intelli
 st.markdown('<div class="sub-title">Multi-Task Acoustic Intelligence: Speaker Diarization • Speaker Verification • Emotion Recognition • Noise-Invariant Sensing</div>', unsafe_allow_html=True)
 
 
-# Cache unified analyzer in Streamlit session state
+# Sidebar Settings & Diagnostics
+st.sidebar.header("⚙️ Configuration & Diagnostics")
+allow_demo = st.sidebar.checkbox(
+    "Synthetic Demo Mode (Unverified Weights)",
+    value=False,
+    help="Permits running the pipeline with randomly initialized weights for testing when trained checkpoints are unavailable."
+)
+
+
+# Cache base analyzer instance (immutable models)
 @st.cache_resource
-def get_analyzer() -> UnifiedAudioAnalyzer:
-    analyzer = UnifiedAudioAnalyzer()
+def get_base_analyzer(demo_mode: bool) -> UnifiedAudioAnalyzer:
+    return UnifiedAudioAnalyzer(strict_checkpoints=not demo_mode, demo_mode=demo_mode)
+
+
+try:
+    analyzer = get_base_analyzer(demo_mode=allow_demo)
+    analyzer_ready = True
+except FileNotFoundError as e:
+    analyzer_ready = False
+    st.sidebar.error(f"⚠️ Checkpoint Guard Error: {e}")
+
+# Maintain session-isolated speaker enrollments
+if "session_enrolled_speakers" not in st.session_state:
+    st.session_state["session_enrolled_speakers"] = {}
     vox_root = BASE_DIR / "wav"
     if vox_root.exists():
         for spk_id in ["id10001", "id10002", "id10003"]:
@@ -59,11 +84,18 @@ def get_analyzer() -> UnifiedAudioAnalyzer:
             if spk_dir.exists():
                 wavs = list(spk_dir.glob("*/*.wav"))
                 if wavs:
-                    analyzer.enroll_known_speaker(f"Speaker_{spk_id}", wavs[0])
-    return analyzer
+                    try:
+                        wave, _ = load_full_audio(wavs[0])
+                        if analyzer_ready:
+                            emb = analyzer.speaker_identifier.extract_embedding(wave)
+                            st.session_state["session_enrolled_speakers"][f"Speaker_{spk_id}"] = emb
+                    except Exception:
+                        pass
 
+# Synchronize session enrollments with analyzer's identifier
+if analyzer_ready:
+    analyzer.speaker_identifier.enrolled_profiles = dict(st.session_state["session_enrolled_speakers"])
 
-analyzer = get_analyzer()
 
 # Sidebar: Hardware Engine Status
 if torch.cuda.is_available():
@@ -77,20 +109,26 @@ st.sidebar.markdown("---")
 
 # Sidebar: Checkpoint Integrity & Provenance
 st.sidebar.header("🧠 Model Checkpoints")
-if analyzer.urban_checkpoint_loaded:
-    st.sidebar.markdown("🟢 **UrbanSound8K:** Trained Checkpoint")
-else:
-    st.sidebar.warning("⚠️ **UrbanSound8K:** Untrained (Random Weights)")
+if analyzer_ready:
+    if analyzer.urban_checkpoint_loaded:
+        sha = f" (`{analyzer.urban_checkpoint_sha256}`)" if analyzer.urban_checkpoint_sha256 else ""
+        st.sidebar.markdown(f"🟢 **UrbanSound8K:** Trained{sha}")
+    else:
+        st.sidebar.warning("⚠️ **UrbanSound8K:** Untrained (Random Weights)")
 
-if analyzer.emotion_checkpoint_loaded:
-    st.sidebar.markdown("🟢 **Emotion:** Trained Checkpoint")
-else:
-    st.sidebar.warning("⚠️ **Emotion:** Untrained (Random Weights)")
+    if analyzer.emotion_checkpoint_loaded:
+        sha = f" (`{analyzer.emotion_checkpoint_sha256}`)" if analyzer.emotion_checkpoint_sha256 else ""
+        st.sidebar.markdown(f"🟢 **Emotion SER:** Trained{sha}")
+    else:
+        st.sidebar.warning("⚠️ **Emotion SER:** Untrained (Random Weights)")
 
-if analyzer.speaker_checkpoint_loaded:
-    st.sidebar.markdown("🟢 **Speaker ID:** Trained Checkpoint")
+    if analyzer.speaker_checkpoint_loaded:
+        sha = f" (`{analyzer.speaker_checkpoint_sha256}`)" if analyzer.speaker_checkpoint_sha256 else ""
+        st.sidebar.markdown(f"🟢 **Speaker ID:** Trained{sha}")
+    else:
+        st.sidebar.warning("⚠️ **Speaker ID:** Untrained (Random Weights)")
 else:
-    st.sidebar.warning("⚠️ **Speaker ID:** Untrained (Random Weights)")
+    st.sidebar.error("❌ Models halted due to missing checkpoints. Enable 'Synthetic Demo Mode' above to proceed.")
 
 st.sidebar.markdown("---")
 
@@ -110,6 +148,7 @@ with tab_pipeline:
     input_mode = st.sidebar.radio("Choose Input Mode", ["Curated Dataset Samples", "Upload Custom WAV"], key="pipeline_input_mode")
 
     selected_file: Optional[Path] = None
+    is_temp_upload = False
 
     if input_mode == "Curated Dataset Samples":
         category = st.sidebar.selectbox(
@@ -132,13 +171,18 @@ with tab_pipeline:
         if files and idx is not None:
             selected_file = files[idx]
     else:
-        uploaded = st.sidebar.file_uploader("Upload .wav file", type=["wav"], key="pipeline_upload")
+        uploaded = st.sidebar.file_uploader("Upload .wav file (Max 25MB)", type=["wav"], key="pipeline_upload")
         if uploaded is not None:
-            temp_path = BASE_DIR / "pipeline_output" / "temp_upload.wav"
-            temp_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(temp_path, "wb") as f:
-                f.write(uploaded.getbuffer())
-            selected_file = temp_path
+            # File size check
+            if uploaded.size > 25 * 1024 * 1024:
+                st.sidebar.error("Uploaded file exceeds maximum limit of 25MB.")
+            else:
+                # Write to unique secure temporary file
+                temp_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+                temp_file.write(uploaded.getbuffer())
+                temp_file.close()
+                selected_file = Path(temp_file.name)
+                is_temp_upload = True
 
     # Noise Injection Settings
     st.sidebar.markdown("---")
@@ -152,99 +196,135 @@ with tab_pipeline:
         target_snr = st.sidebar.slider("Signal-to-Noise Ratio (SNR dB)", min_value=-5.0, max_value=25.0, value=10.0, step=1.0, key="pipeline_snr")
         st.sidebar.caption("Lower SNR = louder street noise (0 dB = equal acoustic power)")
 
-    num_speakers = st.sidebar.number_input("Max Diarization Speakers", min_value=1, max_value=5, value=2, key="pipeline_num_spk")
+    num_speakers = st.sidebar.number_input("Expected Speakers (0 = Auto-Estimate)", min_value=0, max_value=8, value=2, key="pipeline_num_spk")
 
     # Main Tab Display
     if selected_file and selected_file.exists():
-        waveform = load_and_preprocess_audio(selected_file)
-        applied_noise_name = "None (Clean Audio)"
-        current_snr = None
+        try:
+            waveform, audio_dur = load_full_audio(selected_file)
+        except Exception as e:
+            st.error(f"Failed to decode audio file: {e}")
+            waveform = np.array([], dtype=np.float32)
+            audio_dur = 0.0
 
-        if inject_noise:
-            classes_arg = [noise_class] if noise_class is not None else None
-            mixer = UrbanNoiseMixer(classes=classes_arg)
-            waveform, applied_noise_name, current_snr = mixer.mix(waveform, snr_db=target_snr)
+        if audio_dur > 300.0:
+            st.error("Audio duration exceeds 5-minute maximum limit for online analysis.")
+        elif len(waveform) > 0:
+            applied_noise_name = "None (Clean Audio)"
+            current_snr = None
 
-        # 1. Audio Player & Visualizer
-        col1, col2 = st.columns([1, 1])
+            if inject_noise:
+                classes_arg = [noise_class] if noise_class is not None else None
+                mixer = UrbanNoiseMixer(classes=classes_arg)
+                waveform, applied_noise_name, current_snr = mixer.mix(waveform, snr_db=target_snr)
 
-        with col1:
-            st.subheader("🎧 Audio Playback")
-            buf = io.BytesIO()
-            sf.write(buf, waveform, SAMPLE_RATE, format="WAV")
-            st.audio(buf.getvalue(), format="audio/wav")
-            st.caption(f"Source: `{selected_file.name}` | Noise: **{applied_noise_name}**" + (f" @ {current_snr:.1f} dB" if current_snr is not None else ""))
+            # 1. Audio Player & Visualizer
+            col1, col2 = st.columns([1, 1])
 
-        with col2:
-            st.subheader("📊 Audio Waveform & Spectrogram")
-            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(6, 3.2), sharex=False)
-            time_axis = np.linspace(0, len(waveform) / SAMPLE_RATE, len(waveform))
-            ax1.plot(time_axis, waveform, color="#1E88E5", lw=0.8)
-            ax1.set_ylabel("Amp")
-            ax1.set_xlim(0, len(waveform) / SAMPLE_RATE)
-            ax1.grid(True, alpha=0.3)
+            with col1:
+                st.subheader("🎧 Audio Playback")
+                buf = io.BytesIO()
+                sf.write(buf, waveform, SAMPLE_RATE, format="WAV")
+                st.audio(buf.getvalue(), format="audio/wav")
+                st.caption(f"Source: `{selected_file.name}` | Duration: **{audio_dur:.2f}s** | Noise: **{applied_noise_name}**" + (f" @ {current_snr:.1f} dB" if current_snr is not None else ""))
 
-            spec = compute_log_mel_spectrogram(waveform)
-            ax2.imshow(spec, aspect="auto", origin="lower", cmap="magma")
-            ax2.set_xlabel("Time Frames")
-            ax2.set_ylabel("Mel Freq")
-            plt.tight_layout()
-            st.pyplot(fig)
-            plt.close(fig)
+            with col2:
+                st.subheader("📊 Audio Waveform & Spectrogram")
+                fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(6, 3.2), sharex=False)
+                time_axis = np.linspace(0, len(waveform) / SAMPLE_RATE, len(waveform))
+                ax1.plot(time_axis, waveform, color="#1E88E5", lw=0.8)
+                ax1.set_ylabel("Amp")
+                ax1.set_xlim(0, len(waveform) / SAMPLE_RATE)
+                ax1.grid(True, alpha=0.3)
 
-        st.markdown("---")
+                spec = compute_log_mel_spectrogram(waveform)
+                ax2.imshow(spec, aspect="auto", origin="lower", cmap="magma")
+                ax2.set_xlabel("Time Frames")
+                ax2.set_ylabel("Mel Freq")
+                plt.tight_layout()
+                st.pyplot(fig)
+                plt.close(fig)
 
-        # 2. Multi-Task Unified Analysis
-        if st.button("🚀 Run Multi-Task Audio Intelligence Pipeline", type="primary", key="pipeline_run_btn"):
-            with st.spinner("Executing neural inference on CUDA device..."):
-                temp_eval = BASE_DIR / "pipeline_output" / "eval_sample.wav"
-                temp_eval.parent.mkdir(parents=True, exist_ok=True)
-                sf.write(str(temp_eval), waveform, SAMPLE_RATE)
+            st.markdown("---")
 
-                report = analyzer.analyze_audio_file(temp_eval, num_speakers=int(num_speakers))
+            # 2. Multi-Task Unified Analysis
+            if allow_demo:
+                st.markdown(
+                    '<div class="demo-banner">⚠️ <b>Demo Mode Active:</b> Predictions are produced using synthetic unverified model weights for pipeline testing.</div>',
+                    unsafe_allow_html=True,
+                )
 
-                # Metric Cards
-                m1, m2, m3, m4 = st.columns(4)
-                with m1:
-                    st.metric("Total Duration", report["duration"])
-                with m2:
-                    st.metric("Detected Noise Scene", report["environmental_acoustic_scene"]["detected_class"].replace("_", " ").title())
-                with m3:
-                    st.metric("Scene Confidence", f"{report['environmental_acoustic_scene']['confidence']*100:.1f}%")
-                with m4:
-                    st.metric("Speech Turns", report["total_speech_turns"])
+            if not analyzer_ready and not allow_demo:
+                st.warning("Cannot run analysis: Required model checkpoints are missing. Train checkpoints or enable 'Synthetic Demo Mode' in the sidebar.")
+            else:
+                if st.button("🚀 Run Multi-Task Audio Intelligence Pipeline", type="primary", key="pipeline_run_btn"):
+                    device_str = "GPU (CUDA)" if torch.cuda.is_available() else "CPU"
+                    with st.spinner(f"Executing neural multi-task inference on {device_str}..."):
+                        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as eval_tmp:
+                            sf.write(eval_tmp.name, waveform, SAMPLE_RATE)
+                            eval_tmp_path = Path(eval_tmp.name)
 
-                st.markdown("### 🗣️ Speaker Diarization & Emotion Recognition Timeline")
-                turns = report["speaker_diarization_and_emotions"]
-                if turns:
-                    for idx, t in enumerate(turns):
-                        with st.container():
-                            c_turn, c_spk, c_emo = st.columns([1, 2, 2])
-                            with c_turn:
-                                st.markdown(f"**Turn #{idx+1}**<br>`{t['time_range']}`", unsafe_allow_html=True)
-                            with c_spk:
-                                st.markdown(
-                                    f"👤 **Cluster:** `{t['cluster_speaker']}`<br>"
-                                    f"🆔 **Identified:** **{t['identified_speaker']}** ({t['speaker_confidence']*100:.1f}%)",
-                                    unsafe_allow_html=True,
-                                )
-                            with c_emo:
-                                emo_color = {
-                                    "happy": "🟢", "calm": "🔵", "neutral": "⚪",
-                                    "sad": "🔵", "angry": "🔴", "fearful": "🟠",
-                                    "disgust": "🟤", "surprised": "🟡"
-                                }.get(t["emotion"], "🟣")
-                                st.markdown(
-                                    f"🎭 **Emotion:** {emo_color} **{t['emotion'].title()}**<br>"
-                                    f"📊 **Confidence:** {t['emotion_confidence']*100:.1f}%",
-                                    unsafe_allow_html=True,
-                                )
-                            st.markdown("<hr style='margin: 8px 0;'>", unsafe_allow_html=True)
-                else:
-                    st.info("No continuous speech segments detected above the VAD energy threshold (environmental audio dominant).")
+                        try:
+                            spk_arg = None if num_speakers == 0 else int(num_speakers)
+                            report = analyzer.analyze_audio_file(eval_tmp_path, num_speakers=spk_arg)
+                        finally:
+                            if eval_tmp_path.exists():
+                                try:
+                                    os.unlink(eval_tmp_path)
+                                except Exception:
+                                    pass
 
-                with st.expander("📄 View Full JSON Ruflo Session Report"):
-                    st.json(report)
+                        # Metric Cards
+                        m1, m2, m3, m4 = st.columns(4)
+                        with m1:
+                            st.metric("Total Duration", report["duration"])
+                        with m2:
+                            st.metric("Detected Noise Scene", report["environmental_acoustic_scene"]["detected_class"].replace("_", " ").title())
+                        with m3:
+                            st.metric("Scene Confidence", f"{report['environmental_acoustic_scene']['confidence']*100:.1f}%")
+                        with m4:
+                            st.metric("Speech Turns", report["total_speech_turns"])
+
+                        st.markdown("### 🗣️ Continuous Speaker Diarization & Emotion Timeline")
+                        turns = report["speaker_diarization_and_emotions"]
+                        if turns:
+                            for idx, t in enumerate(turns):
+                                with st.container():
+                                    c_turn, c_spk, c_emo = st.columns([1, 2, 2])
+                                    with c_turn:
+                                        st.markdown(f"**Turn #{idx+1}**<br>`{t['time_range']}`", unsafe_allow_html=True)
+                                    with c_spk:
+                                        st.markdown(
+                                            f"👤 **Cluster:** `{t['cluster_speaker']}`<br>"
+                                            f"🆔 **Identified:** **{t['identified_speaker']}** ({t['speaker_confidence']*100:.1f}%)",
+                                            unsafe_allow_html=True,
+                                        )
+                                    with c_emo:
+                                        emo_color = {
+                                            "happy": "🟢", "calm": "🔵", "neutral": "⚪",
+                                            "sad": "🔵", "angry": "🔴", "fearful": "🟠",
+                                            "disgust": "🟤", "surprised": "🟡"
+                                        }.get(t["emotion"], "🟣")
+                                        st.markdown(
+                                            f"🎭 **Emotion:** {emo_color} **{t['emotion'].title()}**<br>"
+                                            f"📊 **Confidence:** {t['emotion_confidence']*100:.1f}%",
+                                            unsafe_allow_html=True,
+                                        )
+                                    st.markdown("<hr style='margin: 8px 0;'>", unsafe_allow_html=True)
+                        else:
+                            st.info("No continuous speech segments detected above the VAD energy threshold (environmental audio dominant).")
+
+                        st.caption("ℹ️ *Disclaimer: Emotion recognition reflects acoustic vocal characteristics and does not provide definitive proof of internal emotional states.*")
+
+                        with st.expander("📄 View Full JSON Ruflo Provenance Report"):
+                            st.json(report)
+
+        # Cleanup uploaded temporary audio if one was created
+        if is_temp_upload and selected_file and selected_file.exists():
+            try:
+                os.unlink(selected_file)
+            except Exception:
+                pass
     else:
         st.info("Please select or upload an audio file from the left sidebar to begin.")
 
@@ -255,8 +335,8 @@ with tab_pipeline:
 with tab_speaker_studio:
     st.header("🆔 Speaker Identification & Voiceprint Verification Studio")
     st.markdown(
-        "Leverages the fine-tuned **VoxCeleb Speaker Embedding Network** (`SpeakerEmbeddingNet` with Temporal Stats Pooling), "
-        "producing compact 128-dimensional L2-normalized voiceprint representations with **85.33% Top-1** and **96.00% Top-5** identification accuracy."
+        "Leverages the **VoxCeleb Speaker Embedding Network** (`SpeakerEmbeddingNet` with Temporal Stats Pooling), "
+        "producing compact 128-dimensional L2-normalized voiceprint representations."
     )
 
     studio_col1, studio_col2 = st.columns([1, 1])
@@ -264,7 +344,7 @@ with tab_speaker_studio:
     # Section A: Enrolled Voiceprint Registry
     with studio_col1:
         st.subheader("📋 Enrolled Voiceprint Registry")
-        enrolled = analyzer.speaker_identifier.enrolled_profiles
+        enrolled = st.session_state.get("session_enrolled_speakers", {})
         if enrolled:
             for name, emb in enrolled.items():
                 with st.expander(f"👤 **{name}** (128-d Vector)", expanded=False):
@@ -280,25 +360,41 @@ with tab_speaker_studio:
                     st.pyplot(fig_emb)
                     plt.close(fig_emb)
         else:
-            st.info("No speakers currently enrolled.")
+            st.info("No speakers currently enrolled in session.")
 
         st.markdown("#### ➕ Enroll New Speaker")
-        new_spk_name = st.text_input("Speaker Label", value="Speaker_Custom", key="new_spk_name")
-        enroll_upload = st.file_uploader("Upload Reference Audio (.wav)", type=["wav"], key="enroll_upload")
+        new_spk_name = st.text_input("Speaker Label (Alphanumeric)", value="Speaker_Custom", key="new_spk_name")
+        enroll_upload = st.file_uploader("Upload Reference Audio (.wav, Max 25MB)", type=["wav"], key="enroll_upload")
 
         if st.button("Enroll Voiceprint into Registry", key="enroll_btn"):
-            if enroll_upload is not None and new_spk_name.strip():
-                enroll_temp = BASE_DIR / "pipeline_output" / f"enroll_{new_spk_name}.wav"
-                with open(enroll_temp, "wb") as f:
-                    f.write(enroll_upload.getbuffer())
-                analyzer.enroll_known_speaker(new_spk_name.strip(), enroll_temp)
-                st.success(f"✅ Successfully enrolled voiceprint for **{new_spk_name.strip()}**!")
-                if hasattr(st, "rerun"):
-                    getattr(st, "rerun")()
-                elif hasattr(st, "experimental_rerun"):
-                    getattr(st, "experimental_rerun")()
+            sanitized_name = re.sub(r"[^a-zA-Z0-9_\-]", "", new_spk_name.strip())
+            if not sanitized_name:
+                st.error("Speaker label must contain valid alphanumeric characters (a-z, A-Z, 0-9, _, -).")
+            elif enroll_upload is None:
+                st.error("Please upload an audio file to extract reference voiceprint.")
+            elif not analyzer_ready:
+                st.error("Speaker embedding model not loaded. Enable Synthetic Demo Mode or train checkpoint.")
             else:
-                st.error("Please provide both a speaker name and an audio file.")
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_enroll:
+                    tmp_enroll.write(enroll_upload.getbuffer())
+                    tmp_path = Path(tmp_enroll.name)
+                try:
+                    ref_wave, _ = load_full_audio(tmp_path)
+                    emb = analyzer.speaker_identifier.extract_embedding(ref_wave)
+                    st.session_state["session_enrolled_speakers"][sanitized_name] = emb
+                    st.success(f"✅ Successfully enrolled voiceprint for **{sanitized_name}** in session!")
+                    if hasattr(st, "rerun"):
+                        getattr(st, "rerun")()
+                    elif hasattr(st, "experimental_rerun"):
+                        getattr(st, "experimental_rerun")()
+                except Exception as e:
+                    st.error(f"Error during enrollment: {e}")
+                finally:
+                    if tmp_path.exists():
+                        try:
+                            os.unlink(tmp_path)
+                        except Exception:
+                            pass
 
     # Section B: Pairwise 1-to-1 Voiceprint Verification
     with studio_col2:
@@ -320,75 +416,82 @@ with tab_speaker_studio:
         threshold = st.slider("Cosine Verification Threshold", min_value=0.20, max_value=0.90, value=0.60, step=0.05, key="verify_thresh")
 
         if st.button("🔬 Compute Pairwise Verification", type="primary", key="verify_btn") and vox_files and idx_a is not None and idx_b is not None:
-            file_a = vox_files[idx_a]
-            file_b = vox_files[idx_b]
-
-            wav_a = load_and_preprocess_audio(file_a)
-            wav_b = load_and_preprocess_audio(file_b)
-
-            emb_a = analyzer.speaker_identifier.extract_embedding(wav_a)
-            emb_b = analyzer.speaker_identifier.extract_embedding(wav_b)
-
-            # Cosine similarity between L2-normalized embeddings
-            cosine_sim = float(np.dot(emb_a, emb_b))
-            is_match = cosine_sim >= threshold
-
-            st.markdown("---")
-            m_col1, m_col2 = st.columns(2)
-            with m_col1:
-                st.metric("Cosine Similarity", f"{cosine_sim:.4f}")
-            with m_col2:
-                st.metric("Threshold", f"{threshold:.2f}")
-
-            # Verification Verdict
-            if is_match:
-                st.markdown(
-                    f'<div class="verdict-match">'
-                    f'<h4>✅ VERIFICATION CONFIRMED: MATCH</h4>'
-                    f'<p>Cosine similarity ({cosine_sim:.4f}) meets or exceeds threshold ({threshold:.2f}). Both utterances originate from the <b>same speaker identity</b>.</p>'
-                    f'</div>',
-                    unsafe_allow_html=True,
-                )
+            if not analyzer_ready:
+                st.error("Model checkpoints unavailable. Enable Synthetic Demo Mode or train checkpoint.")
             else:
-                st.markdown(
-                    f'<div class="verdict-diff">'
-                    f'<h4>❌ VERIFICATION REJECTED: IMPOSTOR / DIFFERENT SPEAKER</h4>'
-                    f'<p>Cosine similarity ({cosine_sim:.4f}) falls below threshold ({threshold:.2f}). Acoustic voiceprints diverge, indicating <b>distinct speakers</b>.</p>'
-                    f'</div>',
-                    unsafe_allow_html=True,
-                )
+                file_a = vox_files[idx_a]
+                file_b = vox_files[idx_b]
 
-            # Visual spectrogram comparison
-            st.markdown("#### Side-by-Side Spectrogram Comparison")
-            fig_cmp, (ax_a, ax_b) = plt.subplots(1, 2, figsize=(8, 2.5))
-            spec_a = compute_log_mel_spectrogram(wav_a)
-            spec_b = compute_log_mel_spectrogram(wav_b)
-            ax_a.imshow(spec_a, aspect="auto", origin="lower", cmap="magma")
-            ax_a.set_title(f"Sample A: {file_a.parent.parent.name}")
-            ax_a.set_xlabel("Time Frames")
-            ax_b.imshow(spec_b, aspect="auto", origin="lower", cmap="magma")
-            ax_b.set_title(f"Sample B: {file_b.parent.parent.name}")
-            ax_b.set_xlabel("Time Frames")
-            plt.tight_layout()
-            st.pyplot(fig_cmp)
-            plt.close(fig_cmp)
+                wav_a, _ = load_full_audio(file_a)
+                wav_b, _ = load_full_audio(file_b)
+
+                emb_a = analyzer.speaker_identifier.extract_embedding(wav_a)
+                emb_b = analyzer.speaker_identifier.extract_embedding(wav_b)
+
+                # Cosine similarity between L2-normalized embeddings
+                cosine_sim = float(np.dot(emb_a, emb_b))
+                is_match = cosine_sim >= threshold
+
+                st.markdown("---")
+                m_col1, m_col2 = st.columns(2)
+                with m_col1:
+                    st.metric("Cosine Similarity", f"{cosine_sim:.4f}")
+                with m_col2:
+                    st.metric("Threshold", f"{threshold:.2f}")
+
+                # Verification Verdict
+                if is_match:
+                    st.markdown(
+                        f'<div class="verdict-match">'
+                        f'<h4>✅ VERIFICATION CONFIRMED: MATCH</h4>'
+                        f'<p>Cosine similarity ({cosine_sim:.4f}) meets or exceeds calibrated threshold ({threshold:.2f}). Both utterances match acoustic voiceprints.</p>'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    st.markdown(
+                        f'<div class="verdict-diff">'
+                        f'<h4>❌ VERIFICATION REJECTED: IMPOSTOR / DIFFERENT SPEAKER</h4>'
+                        f'<p>Cosine similarity ({cosine_sim:.4f}) falls below threshold ({threshold:.2f}). Acoustic voiceprints indicate distinct speakers.</p>'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
+
+                # Visual spectrogram comparison
+                st.markdown("#### Side-by-Side Spectrogram Comparison")
+                fig_cmp, (ax_a, ax_b) = plt.subplots(1, 2, figsize=(8, 2.5))
+                spec_a = compute_log_mel_spectrogram(wav_a)
+                spec_b = compute_log_mel_spectrogram(wav_b)
+                ax_a.imshow(spec_a, aspect="auto", origin="lower", cmap="magma")
+                ax_a.set_title(f"Sample A: {file_a.parent.parent.name}")
+                ax_a.set_xlabel("Time Frames")
+                ax_b.imshow(spec_b, aspect="auto", origin="lower", cmap="magma")
+                ax_b.set_title(f"Sample B: {file_b.parent.parent.name}")
+                ax_b.set_xlabel("Time Frames")
+                plt.tight_layout()
+                st.pyplot(fig_cmp)
+                plt.close(fig_cmp)
 
 
 # ==============================================================================
 # TAB 3: MODEL BENCHMARKS & EXPERIMENT TRACKING
 # ==============================================================================
 with tab_metrics:
-    st.header("📈 Experiment Tracking & Benchmark Analytics")
-    st.markdown("Aggregated performance metrics logged via **Ruflo Experiment Tracker** across cross-validation and deep learning stages.")
+    st.header("📈 Model Benchmarks, Cross-Validation & Provenance")
+    st.markdown(
+        "Empirical performance metrics recorded across cross-validation folds and held-out evaluation sets."
+    )
 
-    ruflo_path = BASE_DIR / "pipeline_output" / "ruflo_experiment_history.json"
-    if ruflo_path.exists():
+    experiments_path = BASE_DIR / "pipeline_output" / "ruflo_experiments.json"
+    if not experiments_path.exists():
+        st.warning("No experiment records found in `pipeline_output/ruflo_experiments.json`. Run training pipelines to populate benchmark results.")
+    else:
         try:
-            history_data = json.loads(ruflo_path.read_text())
-            runs: List[Dict] = history_data.get("runs", [])
+            with open(experiments_path, "r") as f:
+                exp_data = json.load(f)
 
-            urban_runs = [r for r in runs if r.get("experiment") == "urbansound_cnn_specaugment"]
-            vox_runs = [r for r in runs if r.get("experiment") == "voxceleb_speaker_embedding"]
+            urban_runs = [r for r in exp_data.get("runs", []) if "fold" in r.get("run_name", "").lower() or "urban" in r.get("run_name", "").lower()]
+            vox_runs = [r for r in exp_data.get("runs", []) if "vox" in r.get("run_name", "").lower() or "speaker" in r.get("run_name", "").lower()]
 
             col_u1, col_u2 = st.columns([1, 1])
 
@@ -441,32 +544,35 @@ with tab_metrics:
                     plt.close(fig_cv)
 
             with col_u2:
-                st.subheader("🗣️ VoxCeleb Speaker Embedding Network")
+                st.subheader("🗣️ VoxCeleb Speaker Network")
                 if vox_runs:
                     v_run = vox_runs[-1]
                     m_v1, m_v2, m_v3 = st.columns(3)
                     with m_v1:
                         vox_top1 = float(v_run.get('val_accuracy') or 0.0)
-                        st.metric("Top-1 Accuracy", f"{vox_top1*100:.2f}%")
+                        st.metric("Closed-Set Top-1", f"{vox_top1*100:.2f}%")
                     with m_v2:
-                        vox_top5 = float(v_run.get('top5_accuracy', 0.96))
-                        st.metric("Top-5 Accuracy", f"{vox_top5*100:.2f}%")
+                        vox_top5 = v_run.get('top5_accuracy')
+                        if vox_top5 is not None:
+                            st.metric("Top-5 Accuracy", f"{float(vox_top5)*100:.2f}%")
+                        else:
+                            st.metric("Top-5 Accuracy", "Not measured")
                     with m_v3:
                         st.metric("Embedding Dim", "128 (L2)")
 
-                    st.caption("Provenance: Evaluated on 50 VoxCeleb speaker classes (epoch 5 checkpoint)")
-                    st.markdown("**Training Hyperparameters & Specifications:**")
+                    st.caption("ℹ️ *Note: Closed-set identification evaluated on trained speaker gallery. Open-set speaker verification requires pairwise EER evaluation.*")
+                    st.markdown("**Recorded Training Hyperparameters:**")
                     params = v_run.get("hyperparameters", {})
                     st.json(params)
 
                 st.subheader("🎭 RAVDESS Speech Emotion Recognition")
                 st.markdown(
-                    "Trained on 8-class emotional speech taxonomy:\n"
-                    "- `neutral`, `calm`, `happy`, `sad`, `angry`, `fearful`, `disgust`, `surprised`\n"
-                    "- Checkpoint: `best_emotion_model.pt`"
+                    "Evaluated across 8 emotional classes on speaker-independent actor holdout:\n"
+                    "- Classes: `neutral`, `calm`, `happy`, `sad`, `angry`, `fearful`, `disgust`, `surprised`\n"
+                    "- Validation Split: Actors 19-20 (checkpoint selection)\n"
+                    "- Test Split: Actors 21-24 (independent holdout)\n"
+                    "- Active Checkpoint: `best_emotion_model.pt`"
                 )
 
         except Exception as e:
             st.error(f"Error parsing experiment history: {e}")
-    else:
-        st.info("No experiment history found at `pipeline_output/ruflo_experiment_history.json`.")

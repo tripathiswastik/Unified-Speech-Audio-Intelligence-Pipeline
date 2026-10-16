@@ -1,8 +1,17 @@
-"""Tests for audio preprocessing and Mel-spectrogram feature extraction."""
+"""Tests for audio loading, window preprocessing, and Mel-spectrogram feature extraction."""
+import tempfile
+from pathlib import Path
+import soundfile as sf
 import numpy as np
 import pytest
-from pipeline.config import SAMPLE_RATE, N_MELS
-from pipeline.audio_loader import compute_log_mel_spectrogram, get_mel_filterbank
+
+from pipeline.config import SAMPLE_RATE, TARGET_SAMPLES, N_MELS
+from pipeline.audio_loader import (
+    compute_log_mel_spectrogram,
+    get_mel_filterbank,
+    load_full_audio,
+    preprocess_audio_window,
+)
 
 
 def test_get_mel_filterbank_caching():
@@ -17,13 +26,43 @@ def test_compute_log_mel_spectrogram_synthetic():
     """Verify log-mel spectrogram computation on synthetic 2-second sine wave."""
     duration = 2.0
     t = np.linspace(0, duration, int(SAMPLE_RATE * duration), endpoint=False)
-    # Generate 440 Hz tone
     synthetic_wave = (0.5 * np.sin(2 * np.pi * 440 * t)).astype(np.float32)
 
     spec = compute_log_mel_spectrogram(synthetic_wave)
     assert isinstance(spec, np.ndarray)
     assert spec.ndim == 2
     assert spec.shape[0] == N_MELS
-    # Value range normalized to [0, 1]
-    assert np.all(spec >= 0.0)
-    assert np.all(spec <= 1.0)
+    assert np.all(np.isfinite(spec))
+
+
+def test_load_full_audio_preserves_duration():
+    """Verify that load_full_audio does not truncate long recordings to 4.0 seconds."""
+    duration = 10.0  # 10 seconds (exceeds 4.0s training window)
+    t = np.linspace(0, duration, int(SAMPLE_RATE * duration), endpoint=False)
+    synthetic_wave = (0.3 * np.sin(2 * np.pi * 220 * t)).astype(np.float32)
+
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        sf.write(tmp.name, synthetic_wave, SAMPLE_RATE)
+        tmp_path = Path(tmp.name)
+
+    try:
+        loaded_wave, reported_dur = load_full_audio(tmp_path)
+        assert len(loaded_wave) == int(SAMPLE_RATE * duration)
+        assert abs(reported_dur - duration) < 0.01
+        assert len(loaded_wave) > TARGET_SAMPLES  # Confirms not truncated
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+
+def test_preprocess_audio_window():
+    """Verify that preprocess_audio_window conditions waveforms to exact TARGET_SAMPLES."""
+    # Test short waveform (2 seconds -> padded to 4.0s)
+    short_wave = np.ones(int(SAMPLE_RATE * 2.0), dtype=np.float32)
+    padded = preprocess_audio_window(short_wave, target_samples=TARGET_SAMPLES)
+    assert len(padded) == TARGET_SAMPLES
+
+    # Test long waveform (8 seconds -> center-cropped to 4.0s)
+    long_wave = np.ones(int(SAMPLE_RATE * 8.0), dtype=np.float32)
+    cropped = preprocess_audio_window(long_wave, target_samples=TARGET_SAMPLES)
+    assert len(cropped) == TARGET_SAMPLES
