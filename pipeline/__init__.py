@@ -15,6 +15,7 @@ __all__ = [
     "model",
     "ruflo_tracker",
     "speaker_id",
+    "streaming_wavlm",
     "train",
     "train_emotion",
     "train_speaker_id",
