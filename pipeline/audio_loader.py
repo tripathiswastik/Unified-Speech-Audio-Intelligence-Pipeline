@@ -27,18 +27,25 @@ def load_and_preprocess_audio(file_path: Path, target_sr: int = SAMPLE_RATE) -> 
         else:
             waveform = np.mean(waveform, axis=1)
 
-    # Resample if sample rate doesn't match target
-    if sr != target_sr:
-        waveform = librosa.resample(waveform, orig_sr=sr, target_sr=target_sr)
+    # Pre-crop if duration exceeds 4.0s before resampling to save CPU cycles
+    max_raw_samples = int(4.0 * sr)
+    if len(waveform) > max_raw_samples:
+        start = (len(waveform) - max_raw_samples) // 2
+        waveform = waveform[start : start + max_raw_samples]
 
-    # Standardize length to exactly TARGET_SAMPLES (4.0s)
+    # Resample if sample rate doesn't match target using high-speed soxr_fast
+    if sr != target_sr:
+        try:
+            waveform = librosa.resample(waveform, orig_sr=sr, target_sr=target_sr, res_type="soxr_fast")
+        except Exception:
+            waveform = librosa.resample(waveform, orig_sr=sr, target_sr=target_sr)
+
+    # Standardize length to exactly TARGET_SAMPLES (4.0s at target_sr)
     num_samples = len(waveform)
     if num_samples < TARGET_SAMPLES:
-        # Pad with zeros (or repetition)
         pad_width = TARGET_SAMPLES - num_samples
         waveform = np.pad(waveform, (0, pad_width), mode="constant")
     elif num_samples > TARGET_SAMPLES:
-        # Center-crop
         start = (num_samples - TARGET_SAMPLES) // 2
         waveform = waveform[start : start + TARGET_SAMPLES]
 

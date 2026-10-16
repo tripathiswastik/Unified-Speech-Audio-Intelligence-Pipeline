@@ -1,5 +1,6 @@
 """Training & Validation Script for UrbanSound8K with Fold Isolation & Ruflo Tracking."""
 import argparse
+from typing import List, Dict, Any
 from pathlib import Path
 import torch
 import torch.nn as nn
@@ -135,14 +136,74 @@ def run_training(
         checkpoint_path=str(best_checkpoint),
     )
     print(f"\nTraining for Fold {test_fold} Completed! Best Macro-F1: {best_val_f1:.4f}\n")
+    return {
+        "fold": test_fold,
+        "val_accuracy": best_data["val_accuracy"],
+        "val_macro_f1": best_data["val_macro_f1"],
+        "checkpoint": str(best_checkpoint),
+    }
+
+
+def run_cross_validation(
+    folds: List[int] = list(range(1, 11)),
+    epochs: int = DEFAULT_EPOCHS,
+    batch_size: int = BATCH_SIZE,
+    lr: float = LEARNING_RATE,
+    skip_existing: bool = False,
+) -> Dict[str, Any]:
+    tracker = RufloExperimentTracker()
+    print("\n" + "=" * 65)
+    print(f" Starting Full 10-Fold Cross-Validation on UrbanSound8K")
+    print(f" Target Folds: {folds} | Epochs per fold: {epochs} | Batch: {batch_size}")
+    print("=" * 65 + "\n")
+
+    results = []
+    for f in folds:
+        chk = CHECKPOINTS_DIR / f"best_model_fold{f}.pt"
+        if skip_existing and chk.exists():
+            print(f"[CV Runner] Fold {f} checkpoint already exists ({chk.name}). Skipping training.")
+            try:
+                data = torch.load(chk, map_location="cpu")
+                results.append({
+                    "fold": f,
+                    "val_accuracy": data.get("val_accuracy", 0.0),
+                    "val_macro_f1": data.get("val_macro_f1", 0.0),
+                    "checkpoint": str(chk),
+                })
+                continue
+            except Exception:
+                pass
+
+        res = run_training(test_fold=f, epochs=epochs, batch_size=batch_size, lr=lr)
+        results.append(res)
+
+    summary = tracker.get_cv_summary()
+    print("\n" + "=" * 65)
+    print(" Cross-Validation Summary Report")
+    print("=" * 65)
+    print(f" Folds Evaluated: {summary.get('total_folds', len(results))}")
+    print(f" Mean Val Accuracy: {summary.get('mean_val_accuracy', 0.0)*100:.2f}%")
+    print(f" Mean Val Macro-F1: {summary.get('mean_val_macro_f1', 0.0):.4f}")
+    if "std_val_macro_f1" in summary:
+        print(f" Std Dev Macro-F1:  {summary.get('std_val_macro_f1', 0.0):.4f}")
+    print("=" * 65 + "\n")
+    return summary
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="UrbanSound8K Audio Classifier Training")
-    parser.add_argument("--fold", type=int, default=1, help="Test fold number (1-10)")
-    parser.add_argument("--epochs", type=int, default=5, help="Number of training epochs")
+    parser.add_argument("--fold", type=int, default=1, help="Specific test fold number (1-10)")
+    parser.add_argument("--all-folds", action="store_true", help="Run 10-fold cross validation across all folds (1-10)")
+    parser.add_argument("--folds", type=int, nargs="+", default=None, help="Explicit list of folds to train (e.g. --folds 2 3 4)")
+    parser.add_argument("--skip-existing", action="store_true", help="Skip folds with existing checkpoints")
+    parser.add_argument("--epochs", type=int, default=5, help="Number of training epochs per fold")
     parser.add_argument("--batch-size", type=int, default=32, help="Batch size")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     args = parser.parse_args()
 
-    run_training(test_fold=args.fold, epochs=args.epochs, batch_size=args.batch_size, lr=args.lr)
+    if args.all_folds:
+        run_cross_validation(folds=list(range(1, 11)), epochs=args.epochs, batch_size=args.batch_size, lr=args.lr, skip_existing=args.skip_existing)
+    elif args.folds:
+        run_cross_validation(folds=args.folds, epochs=args.epochs, batch_size=args.batch_size, lr=args.lr, skip_existing=args.skip_existing)
+    else:
+        run_training(test_fold=args.fold, epochs=args.epochs, batch_size=args.batch_size, lr=args.lr)

@@ -1,6 +1,6 @@
 """PyTorch Dataset & DataLoaders for UrbanSound8K with SpecAugment and Official Fold Split."""
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict
 import pandas as pd
 import numpy as np
 import torch
@@ -35,6 +35,8 @@ class SpecAugment:
 
 class UrbanSoundDataset(Dataset):
     """UrbanSound8K Dataset partitioned strictly by official folds to prevent leakage."""
+    _SPEC_CACHE: Dict[str, np.ndarray] = {}
+
     def __init__(
         self,
         folds: List[int],
@@ -54,14 +56,18 @@ class UrbanSoundDataset(Dataset):
 
     def __getitem__(self, index: int) -> Tuple[torch.Tensor, int]:
         row = self.df.iloc[index]
-        file_path = self.audio_dir / f"fold{row['fold']}" / row["slice_file_name"]
-        
-        # Load and compute log-mel spectrogram
-        waveform = load_and_preprocess_audio(file_path)
-        spec = compute_log_mel_spectrogram(waveform)
+        file_name = str(row["slice_file_name"])
+
+        if file_name in self._SPEC_CACHE:
+            spec = self._SPEC_CACHE[file_name]
+        else:
+            file_path = self.audio_dir / f"fold{row['fold']}" / file_name
+            waveform = load_and_preprocess_audio(file_path)
+            spec = compute_log_mel_spectrogram(waveform)
+            self._SPEC_CACHE[file_name] = spec
 
         if self.augment and self.spec_augment is not None:
-            spec = self.spec_augment(spec)
+            spec = self.spec_augment(spec.copy())
 
         # Add channel dimension: (1, n_mels, time_steps)
         spec_tensor = torch.from_numpy(spec).unsqueeze(0).float()

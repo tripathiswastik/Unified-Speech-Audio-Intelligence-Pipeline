@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Dict, Any, List
 import json
 import time
+import numpy as np
 
 from pipeline.config import OUTPUT_DIR, CLASSES
 
@@ -57,3 +58,18 @@ class RufloExperimentTracker:
         with open(self.history_file, "w", encoding="utf-8") as f:
             json.dump(self.history, f, indent=2)
         print(f"[Ruflo Tracker] Logged fold {fold} metrics -> Macro F1: {val_macro_f1:.4f}, Accuracy: {val_accuracy:.4f}")
+
+    def get_cv_summary(self) -> Dict[str, Any]:
+        """Compute aggregate cross-validation statistics across all logged fold runs."""
+        self.history = self._load_history()
+        runs = self.history.get("runs", [])
+        if not runs:
+            return {"total_folds": 0}
+        accs = [r["val_accuracy"] for r in runs]
+        f1s = [r["val_macro_f1"] for r in runs]
+        return {
+            "total_folds": len(runs),
+            "mean_val_accuracy": round(sum(accs) / len(accs), 4),
+            "mean_val_macro_f1": round(sum(f1s) / len(f1s), 4),
+            "std_val_macro_f1": round(float(np.std(f1s)), 4) if len(f1s) > 1 else 0.0,
+        }
