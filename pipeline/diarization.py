@@ -87,8 +87,8 @@ class SpeakerDiarizer:
             except TypeError:
                 clustering = AgglomerativeClustering(
                     n_clusters=n_clusters,
-                    affinity="cosine",
                     linkage="average",
+                    **{"affinity": "cosine"},
                 )
             labels = clustering.fit_predict(X)
         else:

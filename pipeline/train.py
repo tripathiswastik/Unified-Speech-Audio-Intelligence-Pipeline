@@ -6,6 +6,7 @@ import torch.nn as nn
 from torch.optim import Adam
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from sklearn.metrics import accuracy_score, f1_score
+import numpy as np
 from tqdm import tqdm
 
 from pipeline.config import (
@@ -60,7 +61,7 @@ def evaluate(model, loader, criterion, device):
     avg_loss = total_loss / len(loader.dataset)
     acc = accuracy_score(all_targets, all_preds)
     macro_f1 = f1_score(all_targets, all_preds, average="macro", zero_division=0)
-    per_class_f1_arr = f1_score(all_targets, all_preds, average=None, zero_division=0)
+    per_class_f1_arr = np.asarray(f1_score(all_targets, all_preds, average=None, zero_division=0))
     per_class_f1 = {CLASSES[i]: float(per_class_f1_arr[i]) for i in range(len(CLASSES))}
 
     return avg_loss, acc, macro_f1, per_class_f1

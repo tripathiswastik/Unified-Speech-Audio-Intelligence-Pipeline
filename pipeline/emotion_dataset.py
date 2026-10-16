@@ -39,16 +39,17 @@ class EmotionDataset(Dataset):
         snr_range: Tuple[float, float] = (0.0, 20.0),
     ):
         self.speech_root = Path(speech_root)
-        df = pd.read_csv(metadata_csv)
-        self.df = df[df["actor_id"].isin(actors)].reset_index(drop=True)
+        raw_df = pd.read_csv(metadata_csv)
+        assert isinstance(raw_df, pd.DataFrame)
+        self.df: pd.DataFrame = raw_df[raw_df["actor_id"].isin(actors)].reset_index(drop=True)
         self.noise_mixer = noise_mixer
         self.snr_range = snr_range
 
     def __len__(self) -> int:
         return len(self.df)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int, str]:
-        row = self.df.iloc[idx]
+    def __getitem__(self, index: int) -> Tuple[torch.Tensor, int, str]:
+        row = self.df.iloc[index]
         file_path = self.speech_root / row["relative_path"]
 
         # Load clean speech

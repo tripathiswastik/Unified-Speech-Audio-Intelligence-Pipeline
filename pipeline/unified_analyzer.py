@@ -6,7 +6,7 @@ Performs:
   4. Speech Emotion Recognition (RAVDESS SER)
 """
 from pathlib import Path
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 import numpy as np
 import torch
 import soundfile as sf
@@ -25,7 +25,7 @@ from pipeline.ruflo_tracker import RufloExperimentTracker
 class UnifiedAudioAnalyzer:
     """Multi-task audio processing pipeline combining UrbanSound, Speaker ID, Emotion & Diarization."""
 
-    def __init__(self, device: torch.device = None):
+    def __init__(self, device: Optional[torch.device] = None):
         self.device = device if device is not None else get_device()
 
         # 1. Environmental Audio Classifier (UrbanSound8K)

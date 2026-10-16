@@ -74,10 +74,10 @@ if input_mode == "Curated Dataset Samples":
         "Dataset Category",
         ["RAVDESS Speech Emotion (wo/)", "UrbanSound8K Background Sound", "VoxCeleb Speaker (wav/)"]
     )
-    if "RAVDESS" in category:
+    if category is not None and "RAVDESS" in category:
         root_dir = BASE_DIR / "wo" / "Audio_Speech_Actors_01-24"
         files = list(root_dir.glob("Actor_*/*.wav"))[:25]
-    elif "UrbanSound" in category:
+    elif category is not None and "UrbanSound" in category:
         root_dir = AUDIO_DIR
         files = list(root_dir.glob("fold1/*.wav"))[:25]
     else:
@@ -86,7 +86,7 @@ if input_mode == "Curated Dataset Samples":
 
     file_names = [f"{f.parent.name}/{f.name}" for f in files]
     idx = st.sidebar.selectbox("Select File", range(len(file_names)), format_func=lambda i: file_names[i])
-    if files:
+    if files and idx is not None:
         selected_file = files[idx]
 else:
     uploaded = st.sidebar.file_uploader("Upload .wav file", type=["wav"])
@@ -118,7 +118,8 @@ if selected_file and selected_file.exists():
     current_snr = None
 
     if inject_noise:
-        mixer = UrbanNoiseMixer(classes=[noise_class])
+        classes_arg = [noise_class] if noise_class is not None else None
+        mixer = UrbanNoiseMixer(classes=classes_arg)
         waveform, applied_noise_name, current_snr = mixer.mix(waveform, snr_db=target_snr)
 
     # 1. Audio Player & Visualizer
@@ -158,7 +159,7 @@ if selected_file and selected_file.exists():
             temp_eval.parent.mkdir(parents=True, exist_ok=True)
             sf.write(str(temp_eval), waveform, SAMPLE_RATE)
 
-            report = analyzer.analyze_audio_file(temp_eval, num_speakers=num_speakers)
+            report = analyzer.analyze_audio_file(temp_eval, num_speakers=int(num_speakers))
 
             # Overview Cards
             m1, m2, m3, m4 = st.columns(4)

@@ -43,16 +43,17 @@ class UrbanSoundDataset(Dataset):
         augment: bool = False,
     ):
         self.audio_dir = Path(audio_dir)
-        self.df = pd.read_csv(metadata_csv)
-        self.df = self.df[self.df["fold"].isin(folds)].reset_index(drop=True)
+        raw_df = pd.read_csv(metadata_csv)
+        assert isinstance(raw_df, pd.DataFrame)
+        self.df: pd.DataFrame = raw_df[raw_df["fold"].isin(folds)].reset_index(drop=True)
         self.augment = augment
         self.spec_augment = SpecAugment() if augment else None
 
     def __len__(self) -> int:
         return len(self.df)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
-        row = self.df.iloc[idx]
+    def __getitem__(self, index: int) -> Tuple[torch.Tensor, int]:
+        row = self.df.iloc[index]
         file_path = self.audio_dir / f"fold{row['fold']}" / row["slice_file_name"]
         
         # Load and compute log-mel spectrogram

@@ -51,7 +51,7 @@ class RufloExperimentTracker:
             "val_macro_f1": round(float(val_macro_f1), 4),
             "per_class_f1": {k: round(float(v), 4) for k, v in per_class_f1.items()},
             "hyperparameters": hyperparameters,
-            "checkpoint": str(checkpoint_path),
+            "checkpoint": checkpoint_path,
         }
         self.history["runs"].append(run_record)
         with open(self.history_file, "w", encoding="utf-8") as f:
