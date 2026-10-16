@@ -149,3 +149,28 @@ class UrbanNoiseMixer:
         )
 
         return mixed.astype(np.float32), noise_class, round(empirical_snr, 2)
+
+    def mix_noise(
+        self,
+        clean_speech: np.ndarray,
+        noise_class: Optional[str] = None,
+        target_snr: Optional[float] = None,
+        snr_range: Tuple[float, float] = (0.0, 20.0),
+    ) -> Tuple[np.ndarray, float]:
+        """Convenience wrapper for callers expecting mix_noise(waveform, noise_class, target_snr).
+        
+        Returns:
+            Tuple of (noisy_waveform, empirical_snr)
+        """
+        if noise_class:
+            filtered = [r for r in self.noise_records if r["class"] == noise_class]
+            if filtered:
+                orig = self.noise_records
+                self.noise_records = filtered
+                try:
+                    mixed, _, snr = self.mix(clean_speech, snr_db=target_snr, snr_range=snr_range)
+                    return mixed, snr
+                finally:
+                    self.noise_records = orig
+        mixed, _, snr = self.mix(clean_speech, snr_db=target_snr, snr_range=snr_range)
+        return mixed, snr

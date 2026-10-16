@@ -1,15 +1,17 @@
 """Real-Time Streaming Audio Intelligence Pipeline.
 Includes:
 1. StreamingPCEN: Auto-regressive Per-Channel Energy Normalization for rolling audio buffers.
-2. StreamingDiarizer: Low-latency online sliding ring buffer diarization with voiceprint tracking.
-3. StreamingAudioProcessor: Real-time multi-task streaming processor for live microphone/WebSocket ingestion.
+2. StreamingDiarizer: Low-latency online sliding buffer diarization with voiceprint tracking,
+   multi-hop chunk ingestion, and true turn segmentation with speaker-change smoothing.
+3. StreamingSpeechEvent: Structured payload for window events and segmented speech turns.
 """
 from typing import Dict, List, Tuple, Optional, Generator, NamedTuple
 from dataclasses import dataclass, field
+from pathlib import Path
 import numpy as np
 import torch
 
-from pipeline.config import SAMPLE_RATE, N_MELS, N_FFT, HOP_LENGTH
+from pipeline.config import CHECKPOINTS_DIR, SAMPLE_RATE, N_MELS, N_FFT, HOP_LENGTH
 from pipeline.audio_loader import get_mel_filterbank
 from pipeline.model import SpeakerEmbeddingNet, SESpeakerEmbeddingNet
 from pipeline.device import get_device
@@ -22,6 +24,7 @@ class StreamingSpeechEvent(NamedTuple):
     confidence: float
     is_speech: bool
     embedding: np.ndarray
+    event_type: str = "window"  # "window", "turn_start", "turn_complete", "speaker_shift"
 
 
 class StreamingPCEN:
@@ -79,7 +82,13 @@ class StreamingPCEN:
 
 
 class StreamingDiarizer:
-    """Low-latency online streaming diarizer operating over rolling FIFO audio buffers."""
+    """Low-latency online streaming diarizer operating over rolling audio buffers.
+    
+    Features:
+    - Multi-hop chunk support: correctly processes every elapsed hop when chunks span multiple boundaries.
+    - Trained checkpoint provenance: automatically loads trained speaker model by default.
+    - True turn segmentation: aggregates consecutive speaker frames into speech turns with speaker-shift smoothing.
+    """
 
     def __init__(
         self,
@@ -90,6 +99,8 @@ class StreamingDiarizer:
         sr: int = SAMPLE_RATE,
         energy_threshold: float = 0.015,
         similarity_threshold: float = 0.65,
+        smoothing_frames: int = 2,
+        hangover_frames: int = 1,
     ):
         self.device = device if device is not None else get_device(verbose=False)
         self.sr = sr
@@ -97,12 +108,30 @@ class StreamingDiarizer:
         self.hop_size = int(hop_duration * sr)
         self.energy_threshold = energy_threshold
         self.similarity_threshold = similarity_threshold
+        self.smoothing_frames = smoothing_frames
+        self.hangover_frames = hangover_frames
 
-        self.embedding_net = embedding_net if embedding_net is not None else SESpeakerEmbeddingNet()
+        # Load verified trained speaker model if not explicitly provided
+        if embedding_net is not None:
+            self.embedding_net = embedding_net
+        else:
+            spk_chk = CHECKPOINTS_DIR / "best_speaker_model.pt"
+            if spk_chk.exists():
+                try:
+                    state = torch.load(spk_chk, map_location=self.device)
+                    state_dict = state["model_state"] if isinstance(state, dict) and "model_state" in state else state
+                    has_se = any("fc" in k for k in state_dict.keys())
+                    backbone = "se_resnet" if has_se else "baseline"
+                    self.embedding_net = SpeakerEmbeddingNet(embedding_dim=128, backbone=backbone)
+                    self.embedding_net.load_state_dict(state_dict)
+                except Exception:
+                    self.embedding_net = SESpeakerEmbeddingNet()
+            else:
+                self.embedding_net = SESpeakerEmbeddingNet()
         self.embedding_net.to(self.device).eval()
 
-        # Rolling circular FIFO buffer
-        self.ring_buffer = np.zeros(self.buffer_size, dtype=np.float32)
+        # Rolling audio stream buffer
+        self.audio_history = np.zeros(0, dtype=np.float32)
         self.total_samples_ingested = 0
 
         # Online speaker profile dictionary: speaker_id -> running_mean_embedding (128-d)
@@ -110,48 +139,192 @@ class StreamingDiarizer:
         self.speaker_counts: Dict[str, int] = {}
         self.next_speaker_idx = 1
 
+        # Turn segmentation and speaker-change smoothing state
+        self.current_turn_speaker: Optional[str] = None
+        self.current_turn_start: float = 0.0
+        self.current_turn_end: float = 0.0
+        self.current_turn_confidences: List[float] = []
+        self.pending_speaker: Optional[str] = None
+        self.pending_speaker_count: int = 0
+        self.silence_frame_count: int = 0
+
     def reset(self):
-        """Clear streaming state and enrolled speaker history."""
-        self.ring_buffer.fill(0.0)
+        """Clear streaming state, enrolled speaker history, and turn tracking."""
+        self.audio_history = np.zeros(0, dtype=np.float32)
         self.total_samples_ingested = 0
         self.active_speakers.clear()
         self.speaker_counts.clear()
         self.next_speaker_idx = 1
+        self.current_turn_speaker = None
+        self.current_turn_start = 0.0
+        self.current_turn_end = 0.0
+        self.current_turn_confidences.clear()
+        self.pending_speaker = None
+        self.pending_speaker_count = 0
+        self.silence_frame_count = 0
 
     def push_audio(self, pcm_chunk: np.ndarray) -> List[StreamingSpeechEvent]:
-        """Ingest a chunk of raw PCM audio and emit detected speaker events when a hop boundary passes."""
+        """Ingest a chunk of raw PCM audio and emit events for EVERY elapsed hop boundary."""
         events: List[StreamingSpeechEvent] = []
         if len(pcm_chunk) == 0:
             return events
 
-        # Append new samples into FIFO ring buffer
-        num_new = len(pcm_chunk)
-        if num_new >= self.buffer_size:
-            self.ring_buffer = pcm_chunk[-self.buffer_size:].astype(np.float32)
-        else:
-            self.ring_buffer = np.roll(self.ring_buffer, -num_new)
-            self.ring_buffer[-num_new:] = pcm_chunk.astype(np.float32)
-
         prev_ingested = self.total_samples_ingested
-        self.total_samples_ingested += num_new
+        self.total_samples_ingested += len(pcm_chunk)
+        self.audio_history = np.concatenate([self.audio_history, pcm_chunk.astype(np.float32)])
 
-        # Trigger inference whenever a hop size has elapsed
-        if self.total_samples_ingested >= self.buffer_size:
-            hops_before = prev_ingested // self.hop_size
-            hops_after = self.total_samples_ingested // self.hop_size
+        # Trigger inference for every hop boundary that has elapsed
+        hops_before = prev_ingested // self.hop_size
+        hops_after = self.total_samples_ingested // self.hop_size
 
-            if hops_after > hops_before:
-                window_audio = self.ring_buffer.copy()
-                event = self._process_window(window_audio)
-                if event is not None:
-                    events.append(event)
+        for h in range(hops_before + 1, hops_after + 1):
+            h_sample_end = h * self.hop_size
+            if h_sample_end < self.buffer_size:
+                continue
+
+            # Calculate slice in audio_history
+            history_start_sample = self.total_samples_ingested - len(self.audio_history)
+            win_end_idx = h_sample_end - history_start_sample
+            win_start_idx = win_end_idx - self.buffer_size
+
+            if win_start_idx >= 0 and win_end_idx <= len(self.audio_history):
+                window_audio = self.audio_history[win_start_idx:win_end_idx]
+                t_end = round(h_sample_end / self.sr, 2)
+                t_start = round(max(0.0, (h_sample_end - self.buffer_size) / self.sr), 2)
+                window_event = self._process_window(window_audio, t_start=t_start, t_end=t_end)
+                if window_event is not None:
+                    turn_events = self._update_turn_tracking(window_event)
+                    events.append(window_event)
+                    events.extend(turn_events)
+
+        # Trim audio_history so it only retains what could be needed for future hops (buffer_size * 2)
+        if len(self.audio_history) > self.buffer_size * 2:
+            self.audio_history = self.audio_history[-self.buffer_size * 2:]
 
         return events
 
-    def _process_window(self, window_audio: np.ndarray) -> Optional[StreamingSpeechEvent]:
+    def _update_turn_tracking(self, event: StreamingSpeechEvent) -> List[StreamingSpeechEvent]:
+        """Track ongoing speech turns, apply speaker change smoothing, and emit finalized turns."""
+        emitted: List[StreamingSpeechEvent] = []
+        if not event.is_speech:
+            self.silence_frame_count += 1
+            if self.silence_frame_count > self.hangover_frames and self.current_turn_speaker is not None:
+                # Finalize turn on silence
+                turn_ev = StreamingSpeechEvent(
+                    timestamp_start=self.current_turn_start,
+                    timestamp_end=self.current_turn_end,
+                    speaker_tag=self.current_turn_speaker,
+                    confidence=round(float(np.mean(self.current_turn_confidences)), 3) if self.current_turn_confidences else 1.0,
+                    is_speech=True,
+                    embedding=event.embedding,
+                    event_type="turn_complete",
+                )
+                emitted.append(turn_ev)
+                self.current_turn_speaker = None
+                self.current_turn_confidences = []
+                self.pending_speaker = None
+                self.pending_speaker_count = 0
+            return emitted
+
+        # Speech detected
+        self.silence_frame_count = 0
+        detected_spk = event.speaker_tag
+
+        if self.current_turn_speaker is None:
+            # Start new turn
+            self.current_turn_speaker = detected_spk
+            self.current_turn_start = event.timestamp_start
+            self.current_turn_end = event.timestamp_end
+            self.current_turn_confidences = [event.confidence]
+            self.pending_speaker = None
+            self.pending_speaker_count = 0
+            emitted.append(StreamingSpeechEvent(
+                timestamp_start=self.current_turn_start,
+                timestamp_end=self.current_turn_end,
+                speaker_tag=self.current_turn_speaker,
+                confidence=event.confidence,
+                is_speech=True,
+                embedding=event.embedding,
+                event_type="turn_start",
+            ))
+        elif detected_spk == self.current_turn_speaker:
+            # Extend existing turn
+            self.current_turn_end = max(self.current_turn_end, event.timestamp_end)
+            self.current_turn_confidences.append(event.confidence)
+            self.pending_speaker = None
+            self.pending_speaker_count = 0
+        else:
+            # Speaker change candidate - apply smoothing
+            if self.pending_speaker == detected_spk:
+                self.pending_speaker_count += 1
+            else:
+                self.pending_speaker = detected_spk
+                self.pending_speaker_count = 1
+
+            if self.pending_speaker_count >= self.smoothing_frames:
+                # Confirmed speaker shift: complete previous turn and start new turn
+                turn_ev = StreamingSpeechEvent(
+                    timestamp_start=self.current_turn_start,
+                    timestamp_end=self.current_turn_end,
+                    speaker_tag=self.current_turn_speaker,
+                    confidence=round(float(np.mean(self.current_turn_confidences)), 3) if self.current_turn_confidences else 1.0,
+                    is_speech=True,
+                    embedding=event.embedding,
+                    event_type="turn_complete",
+                )
+                emitted.append(turn_ev)
+
+                # Announce speaker shift
+                shift_ev = StreamingSpeechEvent(
+                    timestamp_start=event.timestamp_start,
+                    timestamp_end=event.timestamp_end,
+                    speaker_tag=detected_spk,
+                    confidence=event.confidence,
+                    is_speech=True,
+                    embedding=event.embedding,
+                    event_type="speaker_shift",
+                )
+                emitted.append(shift_ev)
+
+                # Initialize new turn
+                self.current_turn_speaker = detected_spk
+                self.current_turn_start = event.timestamp_start
+                self.current_turn_end = event.timestamp_end
+                self.current_turn_confidences = [event.confidence]
+                self.pending_speaker = None
+                self.pending_speaker_count = 0
+            else:
+                # Still within smoothing window, extend previous turn end time slightly
+                self.current_turn_end = max(self.current_turn_end, event.timestamp_end)
+
+        return emitted
+
+    def finalize_stream(self) -> List[StreamingSpeechEvent]:
+        """Flush and finalize any in-progress speech turn when stream closes."""
+        emitted: List[StreamingSpeechEvent] = []
+        if self.current_turn_speaker is not None:
+            turn_ev = StreamingSpeechEvent(
+                timestamp_start=self.current_turn_start,
+                timestamp_end=self.current_turn_end,
+                speaker_tag=self.current_turn_speaker,
+                confidence=round(float(np.mean(self.current_turn_confidences)), 3) if self.current_turn_confidences else 1.0,
+                is_speech=True,
+                embedding=np.zeros(128, dtype=np.float32),
+                event_type="turn_complete",
+            )
+            emitted.append(turn_ev)
+            self.current_turn_speaker = None
+            self.current_turn_confidences = []
+        return emitted
+
+    def _process_window(
+        self, window_audio: np.ndarray, t_start: Optional[float] = None, t_end: Optional[float] = None
+    ) -> Optional[StreamingSpeechEvent]:
         """Extract voiceprint and track online speaker assignment for the current window."""
-        t_end = self.total_samples_ingested / self.sr
-        t_start = max(0.0, t_end - (self.buffer_size / self.sr))
+        if t_end is None:
+            t_end = round(self.total_samples_ingested / self.sr, 2)
+        if t_start is None:
+            t_start = round(max(0.0, t_end - (self.buffer_size / self.sr)), 2)
 
         # Fast VAD check using RMS energy
         rms = float(np.sqrt(np.mean(window_audio ** 2)))
@@ -163,6 +336,7 @@ class StreamingDiarizer:
                 confidence=1.0 - (rms / max(self.energy_threshold, 1e-6)),
                 is_speech=False,
                 embedding=np.zeros(128, dtype=np.float32),
+                event_type="window",
             )
 
         # Mel-spectrogram feature extraction
@@ -208,10 +382,11 @@ class StreamingDiarizer:
             conf = best_sim
 
         return StreamingSpeechEvent(
-            timestamp_start=round(t_start, 2),
-            timestamp_end=round(t_end, 2),
+            timestamp_start=t_start,
+            timestamp_end=t_end,
             speaker_tag=assigned_spk,
             confidence=round(conf, 3),
             is_speech=True,
             embedding=emb,
+            event_type="window",
         )

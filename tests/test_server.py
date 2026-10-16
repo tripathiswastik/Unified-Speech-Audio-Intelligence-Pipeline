@@ -5,7 +5,7 @@ import numpy as np
 import soundfile as sf
 from fastapi.testclient import TestClient
 
-from pipeline.server import app
+from pipeline.server import app, MAX_UPLOAD_BYTES
 from pipeline.config import SAMPLE_RATE
 
 
@@ -23,6 +23,15 @@ def test_healthcheck_endpoint(client):
     assert "checkpoints" in data
     assert "onnx_engines" in data
     assert data["version"] == "2.0.0"
+
+
+def test_readiness_probe_endpoint(client):
+    response = client.get("/ready")
+    assert response.status_code in (200, 503)
+    data = response.json()
+    assert "ready" in data
+    assert "checkpoints" in data
+    assert "urbansound_cnn" in data["checkpoints"]
 
 
 def test_analyze_audio_multipart(client):
@@ -46,6 +55,58 @@ def test_analyze_audio_multipart(client):
     assert "speaker_diarization_and_emotions" in data
     assert "original_filename" in data
     assert data["original_filename"] == "test_tone.wav"
+
+
+def test_analyze_audio_with_noise_injection(client):
+    """Verify that enabling apply_noise with a valid noise_class injects noise and reports SNR."""
+    duration = 2.0
+    t = np.linspace(0, duration, int(SAMPLE_RATE * duration), endpoint=False)
+    wave = (0.3 * np.sin(2 * np.pi * 350 * t)).astype(np.float32)
+
+    buf = io.BytesIO()
+    sf.write(buf, wave, SAMPLE_RATE, format="WAV")
+    buf.seek(0)
+
+    response = client.post(
+        "/api/v1/analyze",
+        files={"file": ("speech_noisy.wav", buf, "audio/wav")},
+        data={
+            "num_speakers": "1",
+            "apply_noise": "true",
+            "noise_class": "siren",
+            "snr_db": "10.0",
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert "noise_injection" in data
+    assert data["noise_injection"]["noise_class"] == "siren"
+    assert "achieved_snr_db" in data["noise_injection"]
+
+
+def test_payload_too_large(client, monkeypatch):
+    """Verify that uploading a payload exceeding MAX_UPLOAD_BYTES returns HTTP 413."""
+    import pipeline.server
+    monkeypatch.setattr(pipeline.server, "MAX_UPLOAD_BYTES", 1024)
+    oversized_data = b"0" * 2048
+    response = client.post(
+        "/api/v1/analyze",
+        files={"file": ("giant_file.wav", oversized_data, "audio/wav")},
+        data={"num_speakers": "0"},
+    )
+    assert response.status_code == 413
+    assert "Payload Too Large" in response.json()["detail"]
+
+
+def test_invalid_audio_format(client):
+    """Verify that uploading malformed audio bytes returns HTTP 400."""
+    corrupted_bytes = b"RIFF0000WAVEfmt corrupted non audio header data"
+    response = client.post(
+        "/api/v1/analyze",
+        files={"file": ("corrupt.wav", corrupted_bytes, "audio/wav")},
+        data={"num_speakers": "0"},
+    )
+    assert response.status_code == 400
 
 
 def test_websocket_streaming_connection(client):
