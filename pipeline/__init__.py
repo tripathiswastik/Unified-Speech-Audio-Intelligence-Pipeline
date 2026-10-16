@@ -19,6 +19,7 @@ __all__ = [
     "train",
     "train_emotion",
     "train_speaker_id",
+    "train_streaming_wavlm",
     "unified_analyzer",
     "urban_noise_mixer",
     "validate_environment",

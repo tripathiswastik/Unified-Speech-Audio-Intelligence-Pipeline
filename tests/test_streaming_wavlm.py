@@ -169,3 +169,71 @@ class TestStreamingWavLMONNXExport:
             np.testing.assert_allclose(ort_outs[1], pt_speaker.numpy(), rtol=1e-3, atol=1e-3)
             np.testing.assert_allclose(ort_outs[2], pt_emotion.numpy(), rtol=1e-3, atol=1e-3)
             np.testing.assert_allclose(ort_outs[3], pt_cache.numpy(), rtol=1e-3, atol=1e-3)
+
+
+class TestMultiTaskTrainingPipeline:
+    """Validate joint multi-task training logic, loss weighting, and gradient flow."""
+
+    def test_uncertainty_loss_formulation(self):
+        from pipeline.train_streaming_wavlm import MultiTaskUncertaintyLoss
+
+        criterion = MultiTaskUncertaintyLoss()
+        l_scene = torch.tensor(1.5, requires_grad=True)
+        l_spk = torch.tensor(2.0, requires_grad=True)
+        l_emo = torch.tensor(1.2, requires_grad=True)
+
+        total_loss, weights = criterion(l_scene, l_spk, l_emo)
+        assert total_loss.item() > 0.0
+        assert weights["w_scene"] > 0.0
+        assert weights["w_spk"] > 0.0
+        assert weights["w_emo"] > 0.0
+
+        total_loss.backward()
+        assert criterion.log_vars.grad is not None
+        assert criterion.log_vars.grad.shape == (3,)
+
+    def test_chunk_streaming_forward_and_gradient_flow(self):
+        from pipeline.train_streaming_wavlm import process_audio_in_streaming_chunks
+        from pipeline.model import ArcMarginProduct
+
+        model = MultiTaskStreamingWavLM(
+            hidden_dim=32,
+            num_layers=2,
+            num_heads=2,
+            ffn_dim=64,
+            max_past_frames=10,
+            early_tap_layer=1,
+            num_scene_classes=10,
+            num_emotion_classes=8,
+            embedding_dim=128,
+        )
+        arc_margin = ArcMarginProduct(in_features=128, out_features=4, scale=16.0, margin=0.2)
+
+        # 2 audio samples, each 6,400 samples (2 sequential 200ms chunks)
+        audio = torch.randn(2, 6400, requires_grad=True)
+        target_scene = torch.tensor([1, 4], dtype=torch.long)
+        target_spk = torch.tensor([0, 2], dtype=torch.long)
+        target_emo = torch.tensor([3, 7], dtype=torch.long)
+
+        scene_l, spk_e, emo_l = process_audio_in_streaming_chunks(model, audio, chunk_samples=3200)
+
+        assert scene_l.shape == (2, 10)
+        assert spk_e.shape == (2, 128)
+        assert emo_l.shape == (2, 8)
+
+        # Compute joint losses
+        loss_s = F.cross_entropy(scene_l, target_scene)
+        loss_spk = F.cross_entropy(arc_margin(spk_e, target_spk), target_spk)
+        loss_e = F.cross_entropy(emo_l, target_emo)
+        joint_loss = loss_s + loss_spk + loss_e
+
+        joint_loss.backward()
+
+        # Verify gradient flow into feature encoder, attention layers, and all heads
+        assert model.feature_encoder.layers[0].conv.weight.grad is not None
+        assert model.layers[0].self_attn.q_proj.weight.grad is not None
+        assert model.scene_head.head[0].weight.grad is not None
+        assert model.voiceprint_head.projection[0].weight.grad is not None
+        assert model.emotion_head.classifier[0].weight.grad is not None
+        assert arc_margin.weight.grad is not None
+
