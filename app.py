@@ -26,6 +26,7 @@ from pipeline.urban_noise_mixer import UrbanNoiseMixer
 from pipeline.unified_analyzer import UnifiedAudioAnalyzer
 from pipeline.streaming import StreamingPCEN, StreamingDiarizer
 from pipeline.device import get_device
+from pipeline.sample_presets import ensure_samplelib_presets, get_curated_datasets
 
 st.set_page_config(
     page_title="UrbanSound Audio Intelligence Hub",
@@ -139,6 +140,10 @@ else:
     st.sidebar.error("❌ Models halted due to missing checkpoints. Enable 'Synthetic Demo Mode' above to proceed.")
 
 
+samplelib_presets = ensure_samplelib_presets()
+curated_catalog = get_curated_datasets()
+
+
 def save_uploaded_to_temp(uploaded_file, session_key_prefix: str) -> Path:
     """Save an uploaded file to a persistent session temp file and return its Path."""
     path_key = f"{session_key_prefix}_path"
@@ -156,34 +161,34 @@ def save_uploaded_to_temp(uploaded_file, session_key_prefix: str) -> Path:
     return saved_path
 
 
-# Sidebar: Audio Input Source (Shared across all tabs)
+# Sidebar: Global Audio Input Source (Available across all tabs)
 st.sidebar.header("📁 Audio Input Source")
-input_mode = st.sidebar.radio("Choose Input Mode", ["Curated Dataset Samples", "Upload Custom WAV"], key="pipeline_input_mode")
+input_mode = st.sidebar.radio(
+    "Choose Input Mode",
+    ["SampleLib Benchmark Presets", "Curated Dataset Samples", "Upload Custom WAV"],
+    index=0,
+    key="pipeline_input_mode",
+)
 
 selected_file: Optional[Path] = None
 global_custom_file: Optional[Path] = None
 global_custom_name: Optional[str] = None
 
-if input_mode == "Curated Dataset Samples":
-    category = st.sidebar.selectbox(
-        "Dataset Category",
-        ["RAVDESS Speech Emotion (wo/)", "UrbanSound8K Background Sound", "VoxCeleb Speaker (wav/)"],
-        key="pipeline_category",
-    )
-    if category is not None and "RAVDESS" in category:
-        root_dir = BASE_DIR / "wo" / "Audio_Speech_Actors_01-24"
-        files = list(root_dir.glob("Actor_*/*.wav"))[:25]
-    elif category is not None and "UrbanSound" in category:
-        root_dir = AUDIO_DIR
-        files = list(root_dir.glob("fold1/*.wav"))[:25]
+if input_mode == "SampleLib Benchmark Presets":
+    preset_choice = st.sidebar.selectbox("Select Benchmark Preset", list(samplelib_presets.keys()), key="pipeline_preset_select")
+    if preset_choice:
+        selected_file = samplelib_presets[preset_choice]
+elif input_mode == "Curated Dataset Samples":
+    cat_names = list(curated_catalog.keys())
+    if cat_names:
+        category = st.sidebar.selectbox("Dataset Category", cat_names, key="pipeline_category")
+        items = curated_catalog.get(category, [])
+        if items:
+            idx = st.sidebar.selectbox("Select File", range(len(items)), format_func=lambda i: items[i][0], key="pipeline_file_idx")
+            if idx is not None:
+                selected_file = items[idx][1]
     else:
-        root_dir = BASE_DIR / "wav"
-        files = list(root_dir.glob("id10001/*/*.wav"))[:25]
-
-    file_names = [f"{f.parent.name}/{f.name}" for f in files]
-    idx = st.sidebar.selectbox("Select File", range(len(file_names)), format_func=lambda i: file_names[i], key="pipeline_file_idx")
-    if files and idx is not None:
-        selected_file = files[idx]
+        st.sidebar.info("No local curated dataset audio folds detected.")
 else:
     uploaded = st.sidebar.file_uploader("Upload .wav file (Max 25MB)", type=["wav"], key="pipeline_upload")
     if uploaded is not None:
@@ -202,6 +207,63 @@ if global_custom_file is None and "global_custom_audio_path" in st.session_state
         global_custom_name = st.session_state.get("global_custom_audio_name")
         if selected_file is None and input_mode == "Upload Custom WAV":
             selected_file = global_custom_file
+
+
+def render_audio_picker(
+    label: str,
+    key_prefix: str,
+    default_source_idx: int = 0,
+    allow_custom_upload: bool = True,
+) -> Tuple[Optional[Path], str]:
+    """Single reusable audio selection component across all tabs to eliminate code duplication."""
+    src_choices = ["SampleLib Presets"]
+    if curated_catalog:
+        src_choices.append("Curated Datasets")
+    if global_custom_file and global_custom_file.exists():
+        src_choices.append(f"📁 Sidebar Upload ({global_custom_name})")
+    if allow_custom_upload:
+        src_choices.append("⬆️ Upload Custom WAV")
+
+    safe_idx = min(default_source_idx, len(src_choices) - 1)
+    choice = st.selectbox(f"{label} Source", src_choices, index=safe_idx, key=f"{key_prefix}_src_select")
+
+    resolved_path: Optional[Path] = None
+    resolved_label: str = label
+
+    if choice == "SampleLib Presets":
+        preset_names = list(samplelib_presets.keys())
+        p_name = st.selectbox(f"Select {label} Preset", preset_names, key=f"{key_prefix}_preset_select")
+        if p_name:
+            resolved_path = samplelib_presets[p_name]
+            resolved_label = p_name
+    elif choice == "Curated Datasets":
+        cat_names = list(curated_catalog.keys())
+        cat = st.selectbox(f"{label} Category", cat_names, key=f"{key_prefix}_cat_select")
+        items = curated_catalog.get(cat, [])
+        if items:
+            idx = st.selectbox(
+                f"Select {label} File",
+                range(len(items)),
+                format_func=lambda i: items[i][0],
+                key=f"{key_prefix}_file_select",
+            )
+            if idx is not None:
+                resolved_path = items[idx][1]
+                resolved_label = items[idx][0]
+    elif choice and choice.startswith("📁 Sidebar Upload"):
+        resolved_path = global_custom_file
+        resolved_label = global_custom_name or "Sidebar Custom Audio"
+    elif choice == "⬆️ Upload Custom WAV":
+        up = st.file_uploader(f"Upload {label} (.wav)", type=["wav"], key=f"{key_prefix}_uploader")
+        if up is not None:
+            resolved_path = save_uploaded_to_temp(up, key_prefix)
+            resolved_label = up.name
+
+    if resolved_path and resolved_path.exists():
+        st.audio(str(resolved_path))
+
+    return resolved_path, resolved_label
+
 
 st.sidebar.markdown("---")
 
@@ -382,21 +444,7 @@ with tab_speaker_studio:
 
         st.markdown("#### ➕ Enroll New Speaker")
         new_spk_name = st.text_input("Speaker Label (Alphanumeric)", value="Speaker_Custom", key="new_spk_name")
-        
-        enroll_opts = ["⬆️ Upload Reference WAV"]
-        if global_custom_file and global_custom_file.exists():
-            enroll_opts.insert(0, f"📁 Use Sidebar Upload ({global_custom_name})")
-        
-        enroll_choice = st.radio("Reference Audio Source", enroll_opts, key="enroll_src_radio")
-        enroll_path: Optional[Path] = None
-        
-        if enroll_choice and enroll_choice.startswith("📁 Use Sidebar Upload"):
-            enroll_path = global_custom_file
-            st.caption(f"Using `{global_custom_name}` for voiceprint registration.")
-        else:
-            enroll_upload = st.file_uploader("Upload Reference Audio (.wav, Max 25MB)", type=["wav"], key="enroll_upload")
-            if enroll_upload is not None:
-                enroll_path = save_uploaded_to_temp(enroll_upload, "enroll_audio")
+        enroll_path, enroll_name = render_audio_picker("Reference Audio", "enroll_src", default_source_idx=0)
 
         if st.button("Enroll Voiceprint into Registry", key="enroll_btn"):
             sanitized_name = re.sub(r"[^a-zA-Z0-9_\-]", "", new_spk_name.strip())
@@ -424,64 +472,14 @@ with tab_speaker_studio:
         st.subheader("🔍 1-to-1 Pairwise Voiceprint Verification")
         st.markdown("Compare two audio recordings to determine if they originate from the **same speaker**.")
 
-        vox_root = BASE_DIR / "wav"
-        vox_files = list(vox_root.glob("*/*/*.wav"))[:40] if vox_root.exists() else []
-        vox_labels = [f"{f.parent.parent.name}/{f.name}" for f in vox_files]
-
-        # Available source choices for Sample A and Sample B
-        src_choices = ["Curated VoxCeleb"]
-        if global_custom_file and global_custom_file.exists():
-            src_choices.append(f"📁 Sidebar Upload ({global_custom_name})")
-        src_choices.append("⬆️ Upload Custom WAV")
-
         c_v1, c_v2 = st.columns(2)
         with c_v1:
             st.markdown("**Voice Sample A**")
-            opt_a = st.selectbox("Sample A Source", src_choices, key="src_a_select")
-            file_a: Optional[Path] = None
-            label_a: str = "Sample A"
-
-            if opt_a and opt_a.startswith("📁 Sidebar Upload"):
-                file_a = global_custom_file
-                label_a = global_custom_name or "Custom Audio A"
-            elif opt_a == "⬆️ Upload Custom WAV":
-                up_a = st.file_uploader("Upload Sample A (.wav)", type=["wav"], key="upload_custom_sample_a")
-                if up_a is not None:
-                    file_a = save_uploaded_to_temp(up_a, "verify_sample_a")
-                    label_a = up_a.name
-            else:
-                if vox_labels:
-                    idx_a = st.selectbox("Select Sample A", range(len(vox_labels)), format_func=lambda i: vox_labels[i], index=0, key="v_sample_a")
-                    if idx_a is not None:
-                        file_a = vox_files[idx_a]
-                        label_a = vox_labels[idx_a]
-
-            if file_a and file_a.exists():
-                st.audio(str(file_a))
+            file_a, label_a = render_audio_picker("Sample A", "verify_sample_a", default_source_idx=1)
 
         with c_v2:
             st.markdown("**Voice Sample B**")
-            opt_b = st.selectbox("Sample B Source", src_choices, index=min(1, len(src_choices)-1), key="src_b_select")
-            file_b: Optional[Path] = None
-            label_b: str = "Sample B"
-
-            if opt_b and opt_b.startswith("📁 Sidebar Upload"):
-                file_b = global_custom_file
-                label_b = global_custom_name or "Custom Audio B"
-            elif opt_b == "⬆️ Upload Custom WAV":
-                up_b = st.file_uploader("Upload Sample B (.wav)", type=["wav"], key="upload_custom_sample_b")
-                if up_b is not None:
-                    file_b = save_uploaded_to_temp(up_b, "verify_sample_b")
-                    label_b = up_b.name
-            else:
-                if vox_labels:
-                    idx_b = st.selectbox("Select Sample B", range(len(vox_labels)), format_func=lambda i: vox_labels[i], index=min(1, len(vox_labels)-1) if len(vox_labels) > 1 else 0, key="v_sample_b")
-                    if idx_b is not None:
-                        file_b = vox_files[idx_b]
-                        label_b = vox_labels[idx_b]
-
-            if file_b and file_b.exists():
-                st.audio(str(file_b))
+            file_b, label_b = render_audio_picker("Sample B", "verify_sample_b", default_source_idx=0)
 
         threshold = st.slider("Cosine Verification Threshold", min_value=0.20, max_value=0.90, value=0.60, step=0.05, key="verify_thresh")
 
@@ -779,53 +777,22 @@ with tab_streaming:
     c_s1, c_s2 = st.columns([1.1, 0.9])
 
     with c_s1:
-        st.subheader("🎙️ Online Streaming Diarizer Simulator")
-        st.caption("Rolling audio buffer processing via `StreamingDiarizer` and `StreamingPCEN`.")
+        st.subheader("🎙️ 10xGraph Real-Time Audio Agent Simulator")
+        st.caption("Full-duplex chunk ingestion queue (`LiveInputQueue`), `StreamingPCEN`, and turn event streaming.")
 
-        chunk_ms = st.slider("Ingestion Chunk Size (ms)", min_value=100, max_value=1000, value=250, step=50, key="streaming_chunk_ms")
-        sim_energy_thresh = st.slider("RMS Energy VAD Threshold", min_value=0.005, max_value=0.10, value=0.015, step=0.005, key="sim_vad_thresh")
-
-        stream_opts = []
-        if global_custom_file and global_custom_file.exists():
-            stream_opts.append(f"📁 Sidebar Upload ({global_custom_name})")
-        stream_opts.append("⬆️ Upload Custom WAV for Streaming")
-        stream_opts.append("Curated VoxCeleb Sample")
-        stream_opts.append("Curated RAVDESS Speech Sample")
-
-        sample_choice = st.selectbox(
-            "Audio Stream Source",
-            stream_opts,
-            key="stream_src_select"
+        stream_audio_path, stream_label = render_audio_picker(
+            "Stream Ingestion Audio",
+            "stream_ingest",
+            default_source_idx=0,
         )
 
-        stream_audio_path: Optional[Path] = None
-        stream_label = "Audio Stream"
-        if sample_choice and sample_choice.startswith("📁 Sidebar Upload"):
-            stream_audio_path = global_custom_file
-            stream_label = global_custom_name or "Custom Audio"
-        elif sample_choice == "⬆️ Upload Custom WAV for Streaming":
-            stream_upload = st.file_uploader("Upload .wav file to stream (Max 25MB)", type=["wav"], key="direct_stream_upload")
-            if stream_upload is not None:
-                stream_audio_path = save_uploaded_to_temp(stream_upload, "stream_direct")
-                stream_label = stream_upload.name
-        elif sample_choice == "Curated VoxCeleb Sample":
-            v_files = list((BASE_DIR / "wav").glob("id10001/*/*.wav"))
-            if v_files:
-                stream_audio_path = v_files[0]
-                stream_label = v_files[0].name
-        else:
-            r_files = list((BASE_DIR / "wo" / "Audio_Speech_Actors_01-24").glob("Actor_*/*.wav"))
-            if r_files:
-                stream_audio_path = r_files[0]
-                stream_label = r_files[0].name
+        col_c1, col_c2 = st.columns(2)
+        with col_c1:
+            chunk_ms = st.slider("Queue Chunk Size (ms)", min_value=100, max_value=1000, value=250, step=50, key="streaming_chunk_ms")
+        with col_c2:
+            sim_energy_thresh = st.slider("VAD Speech Sensitivity (RMS)", min_value=0.005, max_value=0.10, value=0.015, step=0.005, key="sim_vad_thresh")
 
-        if stream_audio_path and stream_audio_path.exists():
-            st.audio(str(stream_audio_path))
-            st.caption(f"Active Stream: `{stream_label}`")
-        else:
-            st.info("Please select or upload a WAV file to simulate streaming ingestion.")
-
-        if st.button("▶️ Launch Stream Ingestion Simulation", key="btn_run_streaming"):
+        if st.button("▶️ Launch 10xGraph Realtime Ingestion Simulation", type="primary", key="btn_run_streaming"):
             if stream_audio_path and stream_audio_path.exists():
                 wave_stream, _ = load_full_audio(stream_audio_path)
                 chunk_samples = int((chunk_ms / 1000.0) * SAMPLE_RATE)
@@ -846,34 +813,105 @@ with tab_streaming:
                 num_chunks = int(np.ceil(len(wave_stream) / chunk_samples))
                 import time
                 t_start_sim = time.time()
+                active_speech_chunks = 0
+                barge_ins = 0
+                prev_speaker = None
+                was_speaking = False
+
+                event_log = []
+                event_log.append({
+                    "Timestamp": "0.00s",
+                    "Event Type": "🟢 session_start",
+                    "Details": f"LiveInputQueue opened (16kHz PCM16, {chunk_ms}ms chunks)",
+                })
 
                 for c_idx in range(num_chunks):
                     chunk = wave_stream[c_idx * chunk_samples : (c_idx + 1) * chunk_samples]
+                    t_chunk_start = (c_idx * chunk_samples) / SAMPLE_RATE
+
                     evs = stream_diarizer.push_audio(chunk)
+                    chunk_rms = float(np.sqrt(np.mean(chunk**2))) if len(chunk) > 0 else 0.0
+                    is_speech_chunk = chunk_rms >= sim_energy_thresh
+
+                    if is_speech_chunk:
+                        active_speech_chunks += 1
+                        if not was_speaking:
+                            was_speaking = True
+                            event_log.append({
+                                "Timestamp": f"{t_chunk_start:.2f}s",
+                                "Event Type": "🗣️ activity_start",
+                                "Details": f"VAD speech detected (RMS: {chunk_rms:.4f})",
+                            })
+                    else:
+                        if was_speaking:
+                            was_speaking = False
+                            event_log.append({
+                                "Timestamp": f"{t_chunk_start:.2f}s",
+                                "Event Type": "🤫 turn_complete",
+                                "Details": "VAD silence threshold reached",
+                            })
+
                     if evs:
-                        stream_events.extend(evs)
+                        for ev in evs:
+                            if ev.is_speech:
+                                if prev_speaker and prev_speaker != ev.speaker_tag:
+                                    barge_ins += 1
+                                    event_log.append({
+                                        "Timestamp": f"{ev.timestamp_start:.2f}s",
+                                        "Event Type": "⚡ interrupted (barge-in)",
+                                        "Details": f"Speaker shift from {prev_speaker} to {ev.speaker_tag}",
+                                    })
+                                prev_speaker = ev.speaker_tag
+                                event_log.append({
+                                    "Timestamp": f"{ev.timestamp_start:.2f}s - {ev.timestamp_end:.2f}s",
+                                    "Event Type": f"👤 speaker_turn ({ev.speaker_tag})",
+                                    "Details": f"Confidence: {ev.confidence:.2f}",
+                                })
+
                     progress_bar.progress(min(1.0, (c_idx + 1) / num_chunks))
 
-                sim_time = time.time() - t_start_sim
-                progress_bar.progress(1.0)
-                status_text.success(
-                    f"✅ Processed {len(wave_stream)/SAMPLE_RATE:.2f}s audio in {sim_time*1000:.1f}ms ({len(stream_events)} speech events)."
-                )
+                sim_time = max(time.time() - t_start_sim, 0.0001)
+                audio_dur = len(wave_stream) / SAMPLE_RATE
+                speedup = audio_dur / sim_time
+                mean_latency_ms = (sim_time / num_chunks) * 1000.0
+                speech_ratio = (active_speech_chunks / max(num_chunks, 1)) * 100.0
 
-                if stream_events:
-                    st.markdown("#### Detected Speech Events")
-                    ev_data = []
-                    for ev in stream_events:
-                        ev_data.append({
-                            "Start (s)": f"{ev.timestamp_start:.2f}s",
-                            "End (s)": f"{ev.timestamp_end:.2f}s",
-                            "Speaker Tag": ev.speaker_tag,
-                            "Confidence": f"{ev.confidence:.3f}",
-                            "Voice": "🗣️ Speech" if ev.is_speech else "🤫 Silence",
-                        })
-                    st.dataframe(ev_data, use_container_width=True)
+                event_log.append({
+                    "Timestamp": f"{audio_dur:.2f}s",
+                    "Event Type": "🏁 session_close",
+                    "Details": f"Completed stream of {num_chunks} chunks in {sim_time*1000:.1f}ms",
+                })
+
+                progress_bar.progress(1.0)
+                status_text.success(f"✅ Ingestion complete: {audio_dur:.2f}s processed at **{speedup:.1f}x real-time**.")
+
+                # Telemetry Cards
+                tm1, tm2, tm3, tm4 = st.columns(4)
+                with tm1:
+                    st.metric("Throughput", f"{speedup:.1f}x RT")
+                with tm2:
+                    st.metric("Mean Latency", f"{mean_latency_ms:.1f} ms")
+                with tm3:
+                    st.metric("Active Voice", f"{speech_ratio:.1f}%")
+                with tm4:
+                    st.metric("Barge-Ins / Shifts", f"{barge_ins}")
+
+                st.markdown("#### 📜 10xGraph Realtime Event Stream")
+                st.dataframe(event_log, use_container_width=True)
             else:
-                st.warning("No sample audio file found.")
+                st.warning("Please provide a valid audio source.")
+
+        with st.expander("💡 10xGraph Realtime Agent Blueprint (Gemini Live / WebSocket Bridge)", expanded=False):
+            st.markdown(
+                """
+                **Full-Duplex Streaming Pipeline (`LiveInputQueue` -> `arealtime`):**
+                * **Ingestion Queue:** PCM16 16kHz audio slices pushed into non-blocking `LiveInputQueue.send_audio()`.
+                * **Streaming PCEN & VAD:** Invariant feature adaptation and energy thresholding determine speech activity boundaries.
+                * **Barge-in Detection:** When new speaker voice activity interrupts ongoing model output, an `interrupted` event is triggered to flush downstream audio buffers.
+                * **WebSocket Bridge:** Can be served over FastAPI at `/v1/graph/live` for web and telephony clients.
+                """
+            )
+
 
     with c_s2:
         st.subheader("📦 Edge Runtime Profiles")
