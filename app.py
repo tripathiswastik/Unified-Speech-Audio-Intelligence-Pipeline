@@ -38,19 +38,22 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-    .main-title { font-size: 2.2rem; font-weight: 700; color: #1E88E5; margin-bottom: 0.2rem; }
-    .sub-title { font-size: 1.05rem; color: #666; margin-bottom: 1.2rem; }
-    .metric-card { background: #f8f9fa; border-radius: 8px; padding: 15px; border-left: 4px solid #1E88E5; }
-    .verdict-match { background-color: #E8F5E9; border-left: 5px solid #2E7D32; padding: 12px 18px; border-radius: 6px; }
-    .verdict-diff { background-color: #FFEBEE; border-left: 5px solid #C62828; padding: 12px 18px; border-radius: 6px; }
-    .demo-banner { background-color: #FFF3E0; border-left: 5px solid #F57C00; padding: 10px 16px; border-radius: 6px; margin-bottom: 12px; }
+    .block-container { padding-top: 1.8rem; padding-bottom: 2rem; }
+    .main-title { font-size: 1.6rem; font-weight: 700; color: #1E88E5; margin-bottom: 0.1rem; }
+    .sub-title { font-size: 0.9rem; color: #666; margin-bottom: 0.8rem; }
+    .metric-card { background: #f8f9fa; border-radius: 6px; padding: 12px; border-left: 3px solid #1E88E5; }
+    .verdict-match { background-color: #E8F5E9; border-left: 4px solid #2E7D32; padding: 10px 14px; border-radius: 6px; }
+    .verdict-diff { background-color: #FFEBEE; border-left: 4px solid #C62828; padding: 10px 14px; border-radius: 6px; }
+    .demo-banner { background-color: #FFF3E0; border-left: 4px solid #F57C00; padding: 8px 12px; border-radius: 6px; margin-bottom: 10px; font-size: 0.9rem; }
+    .stTabs [data-baseweb="tab-list"] { gap: 6px; }
+    .stTabs [data-baseweb="tab"] { font-size: 0.92rem; padding: 6px 14px; font-weight: 600; }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-st.markdown('<div class="main-title">🎙️ UrbanSound8K Speech & Audio Intelligence Hub</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-title">Multi-Task Acoustic Intelligence: Speaker Diarization • Speaker Verification • Emotion Recognition • Noise-Invariant Sensing</div>', unsafe_allow_html=True)
+st.markdown('<div class="main-title">🎙️ UrbanSound Speech & Audio Intelligence Hub</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-title">Diarization • Speaker Verification • Emotion SER • Noise-Invariant Sensing</div>', unsafe_allow_html=True)
 
 
 # Sidebar Settings & Diagnostics
@@ -140,10 +143,10 @@ st.sidebar.markdown("---")
 
 # Main Navigation Tabs
 tab_pipeline, tab_speaker_studio, tab_metrics, tab_streaming = st.tabs([
-    "🎙️ Multi-Task Audio Intelligence Pipeline",
-    "🆔 Speaker Studio & Voiceprint Verification",
-    "📈 Model Benchmarks & Open-Set DET/ROC",
-    "⚡ Real-Time Streaming & Edge Diagnostics",
+    "🎙️ Unified Pipeline",
+    "🆔 Speaker Studio",
+    "📈 Benchmarks",
+    "⚡ Real-Time & Edge",
 ])
 
 
@@ -568,10 +571,16 @@ with tab_metrics:
                     with m_v3:
                         st.metric("Embedding Dim", "128 (L2)")
 
-                    st.caption("ℹ️ *Note: Evaluated with Additive Angular Margin (ArcFace) loss and temporal stats pooling.*")
-                    st.markdown("**Recorded Training Hyperparameters:**")
-                    params = v_run.get("hyperparameters", {})
-                    st.json(params)
+                    st.caption("ℹ️ *Additive Angular Margin (ArcFace) loss with temporal stats pooling.*")
+                    raw_params = v_run.get("hyperparameters", {})
+                    # Clean hyperparameters to avoid dumping hundreds of raw curve points
+                    clean_params = {k: v for k, v in raw_params.items() if k not in ("det_curve", "roc_curve")}
+                    if clean_params:
+                        summary_items = [f"`{k}`: **{v}**" for k, v in clean_params.items() if not isinstance(v, (list, dict))]
+                        if summary_items:
+                            st.markdown("**Hyperparameters:** " + " • ".join(summary_items))
+                        with st.expander("🔍 View Raw Training Config", expanded=False):
+                            st.json(clean_params)
 
                 st.subheader("🎭 RAVDESS Speech Emotion Recognition")
                 if emotion_runs:
@@ -584,21 +593,15 @@ with tab_metrics:
                     with m_e2:
                         st.metric("SER Val Accuracy", f"{e_acc*100:.2f}%")
                 else:
-                    st.markdown(
-                        "Evaluated across 8 emotional classes on speaker-independent actor holdout:\n"
-                        "- Classes: `neutral`, `calm`, `happy`, `sad`, `angry`, `fearful`, `disgust`, `surprised`\n"
-                        "- Validation Split: Actors 19-20 (checkpoint selection)\n"
-                        "- Test Split: Actors 21-24 (independent holdout)\n"
-                        "- Active Checkpoint: `best_emotion_model.pt`"
-                    )
+                    st.caption("8 emotional classes • Speaker-independent holdout (Actors 21-24) • Checkpoint: `best_emotion_model.pt`")
 
             # Open-Set Speaker Verification Benchmarks (ArcFace vs Baseline)
             verif_runs = [r for r in runs if "verification" in r.get("experiment", "").lower() or "det_curve" in r.get("hyperparameters", {})]
             if verif_runs:
                 st.divider()
-                st.subheader("🎯 Open-Set Speaker Verification Benchmarks (DET & ROC Curves)")
-                st.markdown(
-                    "Empirical evaluation on held-out VoxCeleb pairs: mathematically proving that ArcFace (AAM-Softmax) margin loss tightens speaker clusters compared to baseline Cosine CE."
+                st.subheader("🎯 Open-Set Verification (DET & ROC Curves)")
+                st.caption(
+                    "VoxCeleb held-out pairs: SE-ResNet ArcFace (AAM-Softmax) vs. Baseline Cosine CE."
                 )
 
                 arc_run = next((r for r in reversed(verif_runs) if r.get("hyperparameters", {}).get("loss") == "arcface"), None)
@@ -607,8 +610,8 @@ with tab_metrics:
                 c_det1, c_det2 = st.columns(2)
 
                 with c_det1:
-                    st.markdown("#### Detection Error Tradeoff (DET) Curve")
-                    fig_det = plt.figure(figsize=(5.5, 4.2))
+                    st.markdown("#### Detection Error Tradeoff (DET)")
+                    fig_det = plt.figure(figsize=(5.5, 3.8))
                     ax_det = fig_det.add_subplot(111)
 
                     if arc_run and "det_curve" in arc_run.get("hyperparameters", {}):
@@ -640,7 +643,7 @@ with tab_metrics:
 
                 with c_det2:
                     st.markdown("#### Receiver Operating Characteristic (ROC)")
-                    fig_roc = plt.figure(figsize=(5.5, 4.2))
+                    fig_roc = plt.figure(figsize=(5.5, 3.8))
                     ax_roc = fig_roc.add_subplot(111)
 
                     if arc_run and "roc_curve" in arc_run.get("hyperparameters", {}):
@@ -670,34 +673,31 @@ with tab_metrics:
 
             # A/B Experiment Comparison Panel
             st.divider()
-            st.subheader("🔬 A/B Experiment Lineage & Architecture Benchmarks")
-            st.markdown(
-                "Compare baseline architectures against upgraded convolutional backbones, margin losses, and normalization schemes."
-            )
-            ab_comparisons = [
-                {
-                    "Component": "Speaker Identification & Diarization",
-                    "Baseline Architecture": "Baseline Conv2D + Cosine CE",
-                    "Upgraded Architecture": "SE-ResNet Backbone + ArcFace Margin (m=0.30, s=30.0)",
-                    "Key Metric": "Cluster tightness & Inter-class Angular Separation",
-                    "Inference Overhead": "Zero parameter overhead at runtime (128-d vector)",
-                },
-                {
-                    "Component": "Environmental Audio Classifier",
-                    "Baseline Architecture": "AudioCNN (Global Log-Mel Normalization)",
-                    "Upgraded Architecture": "SEAudioCNN + Per-Channel CMVN Normalization",
-                    "Key Metric": "Noise-robust Macro-F1 across background stationary noise",
-                    "Inference Overhead": "+4 SE Squeeze-and-Excitation Attention Blocks (~2% latency)",
-                },
-                {
-                    "Component": "Speech Emotion Recognition (SER)",
-                    "Baseline Architecture": "EmotionClassifierCNN (Handcrafted Mel-Spectrogram)",
-                    "Upgraded Architecture": "SSLEmotionClassifier (Pretrained wav2vec 2.0 / HuBERT Adapter)",
-                    "Key Metric": "Speech Invariance & Cross-Actor Generalization",
-                    "Inference Overhead": "Frozen upstream transformer with lightweight attentive pooling",
-                },
-            ]
-            st.dataframe(ab_comparisons, use_container_width=True)
+            with st.expander("🔬 Architecture Lineage & A/B Specifications", expanded=False):
+                ab_comparisons = [
+                    {
+                        "Component": "Speaker Diarization",
+                        "Baseline Architecture": "Baseline Conv2D + Cosine CE",
+                        "Upgraded Architecture": "SE-ResNet + ArcFace Margin (m=0.30)",
+                        "Key Metric": "Cluster tightness & Inter-class separation",
+                        "Overhead": "Zero runtime overhead (128-d)",
+                    },
+                    {
+                        "Component": "Environmental Classifier",
+                        "Baseline Architecture": "AudioCNN (Global Log-Mel)",
+                        "Upgraded Architecture": "SEAudioCNN + CMVN Normalization",
+                        "Key Metric": "Noise-robust Macro-F1 across stationary noise",
+                        "Overhead": "+4 SE Blocks (~2% latency)",
+                    },
+                    {
+                        "Component": "Speech Emotion Recognition",
+                        "Baseline Architecture": "EmotionClassifierCNN (Handcrafted Mel)",
+                        "Upgraded Architecture": "SSLEmotionClassifier (wav2vec 2.0)",
+                        "Key Metric": "Speech Invariance & Cross-Actor holdout",
+                        "Overhead": "Lightweight attentive pooling adapter",
+                    },
+                ]
+                st.dataframe(ab_comparisons, use_container_width=True)
 
         except Exception as e:
             st.error(f"Error parsing experiment history: {e}")
@@ -707,18 +707,11 @@ with tab_metrics:
 # TAB 4: REAL-TIME STREAMING & EDGE DIAGNOSTICS
 # ==============================================================================
 with tab_streaming:
-    st.header("⚡ Real-Time Streaming & Edge Diagnostics")
-    st.markdown(
-        "Low-latency streaming architecture with auto-regressive PCEN, online ring-buffer diarization, and edge ONNX runtime profiles."
-    )
-
     c_s1, c_s2 = st.columns([1.1, 0.9])
 
     with c_s1:
         st.subheader("🎙️ Online Streaming Diarizer Simulator")
-        st.caption(
-            "Processes rolling audio buffers via StreamingDiarizer and StreamingPCEN without global future-context dependencies."
-        )
+        st.caption("Rolling audio buffer processing via `StreamingDiarizer` and `StreamingPCEN`.")
 
         chunk_ms = st.slider("Ingestion Chunk Size (ms)", min_value=100, max_value=1000, value=250, step=50, key="streaming_chunk_ms")
         sim_energy_thresh = st.slider("RMS Energy VAD Threshold", min_value=0.005, max_value=0.10, value=0.015, step=0.005, key="sim_vad_thresh")
@@ -742,7 +735,7 @@ with tab_streaming:
         if stream_audio_path and stream_audio_path.exists():
             st.audio(str(stream_audio_path))
 
-        if st.button("▶️ Launch Real-Time Stream Ingestion Simulation", key="btn_run_streaming"):
+        if st.button("▶️ Launch Stream Ingestion Simulation", key="btn_run_streaming"):
             if stream_audio_path and stream_audio_path.exists():
                 wave_stream, _ = load_full_audio(stream_audio_path)
                 chunk_samples = int((chunk_ms / 1000.0) * SAMPLE_RATE)
@@ -774,11 +767,11 @@ with tab_streaming:
                 sim_time = time.time() - t_start_sim
                 progress_bar.progress(1.0)
                 status_text.success(
-                    f"✅ Ingestion complete: {len(wave_stream)/SAMPLE_RATE:.2f}s audio streamed in {sim_time*1000:.1f}ms ({len(stream_events)} speech events detected)."
+                    f"✅ Processed {len(wave_stream)/SAMPLE_RATE:.2f}s audio in {sim_time*1000:.1f}ms ({len(stream_events)} speech events)."
                 )
 
                 if stream_events:
-                    st.markdown("#### Detected Streaming Speech Events")
+                    st.markdown("#### Detected Speech Events")
                     ev_data = []
                     for ev in stream_events:
                         ev_data.append({
@@ -786,49 +779,48 @@ with tab_streaming:
                             "End (s)": f"{ev.timestamp_end:.2f}s",
                             "Speaker Tag": ev.speaker_tag,
                             "Confidence": f"{ev.confidence:.3f}",
-                            "Speech / Silence": "🗣️ Speech" if ev.is_speech else "🤫 Silence",
+                            "Voice": "🗣️ Speech" if ev.is_speech else "🤫 Silence",
                         })
                     st.dataframe(ev_data, use_container_width=True)
             else:
                 st.warning("No sample audio file found.")
 
     with c_s2:
-        st.subheader("📦 ONNX & TensorRT Edge Runtime")
-        st.caption("Operator compatibility validated for low-power edge accelerators (Raspberry Pi 4, Jetson Nano, WebAssembly).")
+        st.subheader("📦 Edge Runtime Profiles")
+        st.caption("Operator compatibility & footprint across low-power edge accelerators.")
 
         onnx_audio = CHECKPOINTS_DIR / "se_audiocnn.onnx"
         onnx_spk = CHECKPOINTS_DIR / "se_speaker_embedding.onnx"
 
         st.markdown("**Exported Engine Artifacts:**")
-        if onnx_audio.exists():
-            sz = onnx_audio.stat().st_size / (1024 * 1024)
-            st.success(f"🟢 **SEAudioCNN (ONNX):** `{onnx_audio.name}` ({sz:.2f} MB) [Dynamic Batch]")
-        else:
-            st.warning("⚠️ `se_audiocnn.onnx` not found.")
+        art_col1, art_col2 = st.columns(2)
+        with art_col1:
+            if onnx_audio.exists():
+                sz = onnx_audio.stat().st_size / (1024 * 1024)
+                st.success(f"🟢 **SEAudioCNN**<br>`{onnx_audio.name}` ({sz:.2f} MB)", unsafe_allow_html=True)
+            else:
+                st.warning("⚠️ `se_audiocnn.onnx` missing")
+        with art_col2:
+            if onnx_spk.exists():
+                sz = onnx_spk.stat().st_size / (1024 * 1024)
+                st.success(f"🟢 **SESpeakerNet**<br>`{onnx_spk.name}` ({sz:.2f} MB)", unsafe_allow_html=True)
+            else:
+                st.warning("⚠️ `se_speaker_embedding.onnx` missing")
 
-        if onnx_spk.exists():
-            sz = onnx_spk.stat().st_size / (1024 * 1024)
-            st.success(f"🟢 **SESpeakerEmbeddingNet (ONNX):** `{onnx_spk.name}` ({sz:.2f} MB) [Dynamic Batch + Time]")
-        else:
-            st.warning("⚠️ `se_speaker_embedding.onnx` not found.")
+        st.markdown("**Edge Latency & Footprint:**")
+        col_hw1, col_hw2 = st.columns(2)
+        with col_hw1:
+            st.metric("SE-CNN (Pi 4 / Jetson Nano)", "~17.4 ms", "4.5 MB (<10MB RAM)")
+        with col_hw2:
+            st.metric("SSL Transformer (Server GPU)", "~251.7 ms", "376 MB (~1.2GB RAM)")
 
-        st.markdown("**Validated Edge Operators:**")
-        st.markdown(
-            """
-            - `DepthwiseSeparableConv2d`: Mapped to standard ONNX `Conv` with `group=in_channels`
-            - `SEBlock (Squeeze-and-Excitation)`: Mapped to `GlobalAveragePool` + `MatMul` + `Sigmoid` + `Mul`
-            - `Per-Channel Energy Normalization (PCEN)`: Mapped to elementwise `ReduceMean`, `Pow`, `Div`
-            - `TemporalStatsPooling`: Mapped to `ReduceMean` + `ReduceStd` along time axis
-            """
-        )
-
-        st.markdown("**Hardware Latency & Memory Footprint:**")
-        st.markdown(
-            """
-            | Architecture Front-End | Parameters | Size (MB) | Mean Latency (ms) | Memory Overhead | Target Edge Device |
-            | :--- | :--- | :--- | :--- | :--- | :--- |
-            | **SE-CNN (Depthwise + SE)** | ~1.1M | **4.5 MB** | **~17.4 ms** | **< 10 MB RAM** | Raspberry Pi 4 / Jetson Nano / WebAssembly |
-            | **SSL Transformer (wav2vec 2.0)** | ~94.0M | **376.0 MB** | **~251.7 ms** | **~1.2 GB RAM** | Server GPU / Jetson Orin |
-            """
-        )
+        with st.expander("🛠️ Validated Edge Operators", expanded=False):
+            st.markdown(
+                """
+                - **DepthwiseSeparableConv2d**: Standard ONNX `Conv` with `group=in_channels`
+                - **SEBlock**: `GlobalAveragePool` + `MatMul` + `Sigmoid` + `Mul`
+                - **StreamingPCEN**: Auto-regressive `ReduceMean` + `Pow` + `Div`
+                - **TemporalStatsPooling**: `ReduceMean` + `ReduceStd` along time axis
+                """
+            )
 
