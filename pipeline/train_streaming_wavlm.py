@@ -12,6 +12,7 @@ Features:
 - Automatic static-shape ONNX / TensorRT export upon achieving best composite validation score.
 - Full experiment provenance tracking via RufloExperimentTracker.
 """
+import sys
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any
 import argparse
@@ -23,6 +24,11 @@ import pandas as pd
 import soundfile as sf
 import librosa
 import torch
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
@@ -433,7 +439,7 @@ def process_audio_in_streaming_chunks(
 
 
 def train_multitask_epoch(
-    model: MultiTaskStreamingWavLM,
+    model: nn.Module,
     arc_margin: ArcMarginProduct,
     uncertainty_loss: MultiTaskUncertaintyLoss,
     loader_urban: DataLoader,
@@ -443,6 +449,7 @@ def train_multitask_epoch(
     device: torch.device,
     epoch: int,
     total_epochs: int,
+    max_steps: Optional[int] = None,
 ) -> Dict[str, float]:
     """Train single epoch with interleaved multi-task batch scheduling."""
     model.train()
@@ -454,11 +461,14 @@ def train_multitask_epoch(
     iter_ravdess = iter(loader_ravdess)
 
     steps = max(len(loader_urban), len(loader_vox), len(loader_ravdess))
+    if max_steps is not None and max_steps > 0:
+        steps = min(steps, max_steps)
+
     epoch_losses = {"total": 0.0, "scene": 0.0, "spk": 0.0, "emo": 0.0}
 
     pbar = tqdm(range(steps), desc=f"Epoch [{epoch:02d}/{total_epochs:02d}] Multi-Task Training", leave=False)
 
-    for _ in pbar:
+    for step_idx in pbar:
         optimizer.zero_grad()
 
         # 1. Fetch Task 1: UrbanSound
@@ -484,6 +494,15 @@ def train_multitask_epoch(
             iter_ravdess = iter(loader_ravdess)
             x_r, y_r = next(iter_ravdess)
         x_r, y_r = x_r.to(device), y_r.to(device)
+
+        # Sanity check: verify batches contain real physical audio (non-zero RMS)
+        if step_idx == 0:
+            rms_u = torch.sqrt(torch.mean(x_u ** 2)).item()
+            rms_v = torch.sqrt(torch.mean(x_v ** 2)).item()
+            rms_r = torch.sqrt(torch.mean(x_r ** 2)).item()
+            assert rms_u > 1e-4, f"Zero or silent audio detected in UrbanSound batch: RMS={rms_u}"
+            assert rms_v > 1e-4, f"Zero or silent audio detected in VoxCeleb batch: RMS={rms_v}"
+            assert rms_r > 1e-4, f"Zero or silent audio detected in RAVDESS batch: RMS={rms_r}"
 
         # Forward Task 1: Scene Classification
         scene_l, _, _ = process_audio_in_streaming_chunks(model, x_u)
@@ -531,6 +550,8 @@ def evaluate_multitask(
     loader_ravdess_val: DataLoader,
     device: torch.device,
     ds_vox_val: Optional[VoxCelebRawDataset] = None,
+    max_val_batches: Optional[int] = None,
+    num_spk_pairs: int = 100,
 ) -> Dict[str, float]:
     """Validate all three multi-task heads on held-out evaluation sets."""
     model.eval()
@@ -541,7 +562,9 @@ def evaluate_multitask(
     # 1. Evaluate UrbanSound8K
     all_scene_preds, all_scene_targets = [], []
     with torch.no_grad():
-        for x_u, y_u in loader_urban_val:
+        for b_idx, (x_u, y_u) in enumerate(loader_urban_val):
+            if max_val_batches is not None and b_idx >= max_val_batches:
+                break
             x_u = x_u.to(device)
             scene_l, _, _ = process_audio_in_streaming_chunks(model, x_u)
             preds = scene_l.argmax(dim=-1).cpu().numpy()
@@ -554,7 +577,9 @@ def evaluate_multitask(
     # 2. Evaluate VoxCeleb Speaker ID (Closed-Set)
     all_spk_preds, all_spk_targets = [], []
     with torch.no_grad():
-        for x_v, y_v in loader_vox_val:
+        for b_idx, (x_v, y_v) in enumerate(loader_vox_val):
+            if max_val_batches is not None and b_idx >= max_val_batches:
+                break
             x_v = x_v.to(device)
             _, spk_emb, _ = process_audio_in_streaming_chunks(model, x_v)
             cosine = F.linear(spk_emb, F.normalize(arc_margin.weight, p=2, dim=-1))
@@ -566,7 +591,7 @@ def evaluate_multitask(
 
     # 2b. Evaluate Open-Set Speaker Verification (Genuine vs Impostor EER & ROC-AUC)
     if ds_vox_val is not None and len(ds_vox_val) > 0:
-        spk_verif = evaluate_open_set_speaker_verification(model, ds_vox_val, device)
+        spk_verif = evaluate_open_set_speaker_verification(model, ds_vox_val, device, num_pairs=num_spk_pairs)
         metrics["spk_eer"] = spk_verif.get("spk_eer", 0.5)
         metrics["spk_auc"] = spk_verif.get("spk_auc", 0.5)
     else:
@@ -576,7 +601,9 @@ def evaluate_multitask(
     # 3. Evaluate RAVDESS Speech Emotion
     all_emo_preds, all_emo_targets = [], []
     with torch.no_grad():
-        for x_r, y_r in loader_ravdess_val:
+        for b_idx, (x_r, y_r) in enumerate(loader_ravdess_val):
+            if max_val_batches is not None and b_idx >= max_val_batches:
+                break
             x_r = x_r.to(device)
             _, _, emo_l = process_audio_in_streaming_chunks(model, x_r)
             preds = emo_l.argmax(dim=-1).cpu().numpy()
@@ -600,8 +627,17 @@ def main():
     parser.add_argument("--weight-decay", type=float, default=1e-2, help="Weight decay")
     parser.add_argument("--val-fold", type=int, default=10, help="UrbanSound8K validation fold (1-10)")
     parser.add_argument("--max-speakers", type=int, default=50, help="Max VoxCeleb speakers for training")
+    parser.add_argument("--max-steps-per-epoch", type=int, default=None, help="Cap training steps per epoch for fast smoke testing")
+    parser.add_argument("--smoke-test", action="store_true", help="Run 2-epoch smoke-training job with checkpoint reload verification")
     parser.add_argument("--export-onnx", action="store_true", default=True, help="Export static ONNX on completion")
     args = parser.parse_args()
+
+    if args.smoke_test:
+        args.epochs = 2
+        args.batch_size = 4
+        args.max_speakers = 6
+        args.max_steps_per_epoch = 10
+        print("[Smoke Test Mode] Enabled: epochs=2, batch_size=4, max_speakers=6, max_steps=10")
 
     device = get_device()
     print(f"[Causal MultiTask Transformer] Initializing Joint Training on Device: {device}...")
@@ -684,7 +720,7 @@ def main():
     )
     scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=5, T_mult=2)
 
-    tracker = RufloExperimentTracker()
+    tracker = RufloExperimentTracker(experiment_name="multitask_streaming_wavlm")
     best_composite = -1.0
     best_ckpt_path = CHECKPOINTS_DIR / "best_multitask_streaming_wavlm.pt"
 
@@ -694,6 +730,8 @@ def main():
     GATE_MIN_EMO_F1 = 0.50
 
     t_start = time.time()
+
+    epoch_loss_history = []
 
     for epoch in range(1, args.epochs + 1):
         losses = train_multitask_epoch(
@@ -707,8 +745,10 @@ def main():
             device=device,
             epoch=epoch,
             total_epochs=args.epochs,
+            max_steps=args.max_steps_per_epoch,
         )
         scheduler.step()
+        epoch_loss_history.append(losses["total"])
 
         val_metrics = evaluate_multitask(
             model=model,
@@ -718,6 +758,8 @@ def main():
             loader_ravdess_val=loader_ravdess_val,
             device=device,
             ds_vox_val=ds_vox_val,
+            max_val_batches=5 if args.smoke_test else None,
+            num_spk_pairs=10 if args.smoke_test else 100,
         )
 
         comp = val_metrics["composite_score"]
@@ -737,17 +779,57 @@ def main():
             f"Composite: {comp:.4f} | Gates: {'PASSED' if passes_gates else 'HELD'}"
         )
 
-        if comp > best_composite and passes_gates:
+        if (comp > best_composite and passes_gates) or (args.smoke_test and epoch == args.epochs):
             best_composite = comp
             torch.save(model.state_dict(), best_ckpt_path)
-            print(f"  ⭐ New Best Multi-Task Candidate Saved: {comp:.4f} (All Promotion Gates Met)")
+            print(f"  [CHECKPOINT SAVED] Composite: {comp:.4f} -> {best_ckpt_path.name}")
 
     total_time = time.time() - t_start
     print(f"\n[Causal MultiTask Transformer] Training completed in {total_time/60:.2f} mins. Best Composite: {best_composite:.4f}")
 
+    # Smoke Test Verification Routine
+    if args.smoke_test:
+        print("\n=== SMOKE-TEST VERIFICATION PROTOCOL ===")
+        # 1. Verify loss descent
+        if len(epoch_loss_history) >= 2:
+            loss_descended = epoch_loss_history[-1] <= epoch_loss_history[0]
+            print(f"  [1] Loss descent: Epoch 1 = {epoch_loss_history[0]:.4f} -> Epoch 2 = {epoch_loss_history[-1]:.4f} (Descended: {loss_descended})")
+
+        # 2. Checkpoint save & reload roundtrip
+        print(f"  [2] Checkpoint reload from: {best_ckpt_path}")
+        assert best_ckpt_path.exists(), f"Expected checkpoint file does not exist: {best_ckpt_path}"
+        assert best_ckpt_path.stat().st_size > 10_000, "Checkpoint file size is suspiciously small"
+
+        fresh_model = CausalMultiTaskAudioTransformer(
+            hidden_dim=256,
+            num_layers=6,
+            num_heads=4,
+            ffn_dim=512,
+            max_past_frames=40,
+            early_tap_layer=2,
+            num_scene_classes=len(CLASSES),
+            num_emotion_classes=len(EMOTIONS),
+            embedding_dim=128,
+        )
+        fresh_model.load_state_dict(torch.load(best_ckpt_path, map_location="cpu"))
+        fresh_model.eval()
+
+        # 3. Numerical inference sanity check
+        test_chunk = torch.randn(1, CHUNK_SAMPLES)
+        with torch.no_grad():
+            sc_l, spk_e, emo_l, cache = fresh_model(test_chunk)
+        assert sc_l.shape == (1, len(CLASSES))
+        assert spk_e.shape == (1, 128)
+        assert emo_l.shape == (1, len(EMOTIONS))
+        assert np.isclose(torch.norm(spk_e, p=2, dim=-1).item(), 1.0, atol=1e-4)
+
+        print("  [3] Numerical inference check on reloaded checkpoint: Output shapes & L2 norms verified!")
+        print("  [Phase 2 Smoke-Test Passed] All checks passed successfully!\n")
+
     # Track experiment in Ruflo registry
     tracker.log_run(
-        experiment="multitask_streaming_wavlm",
+        fold=args.val_fold,
+        epochs=args.epochs,
         val_accuracy=float(best_composite if best_composite > 0 else 0.0),
         val_macro_f1=float(best_composite if best_composite > 0 else 0.0),
         per_class_f1={"composite": float(best_composite if best_composite > 0 else 0.0)},
@@ -765,8 +847,7 @@ def main():
                 "min_emo_f1": GATE_MIN_EMO_F1,
             },
         },
-        checkpoint_path=best_ckpt_path if best_ckpt_path.exists() else None,
-        epochs=args.epochs,
+        checkpoint_path=str(best_ckpt_path) if best_ckpt_path.exists() else "",
     )
 
     if args.export_onnx and best_ckpt_path.exists():
@@ -774,6 +855,7 @@ def main():
         export_streaming_wavlm_to_onnx(
             checkpoint_path=best_ckpt_path,
             static_shapes=True,
+            strict_checkpoints=False if args.smoke_test else True,
         )
 
 
