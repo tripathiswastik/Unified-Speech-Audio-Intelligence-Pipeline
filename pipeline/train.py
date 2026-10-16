@@ -19,7 +19,7 @@ from pipeline.config import (
     DEFAULT_EPOCHS,
 )
 from pipeline.dataset import get_dataloaders
-from pipeline.model import AudioCNN
+from pipeline.model import AudioCNN, SEAudioCNN
 from pipeline.ruflo_tracker import RufloExperimentTracker
 
 
@@ -74,11 +74,13 @@ def run_training(
     batch_size: int = BATCH_SIZE,
     lr: float = LEARNING_RATE,
     num_workers: int = 0,
+    model_type: str = "baseline",
+    use_cmvn: bool = False,
 ):
     device = get_device()
     print(f"\n=======================================================")
     print(f" Starting UrbanSound8K Training | Test Fold: {test_fold}")
-    print(f" Target Device: {device} | Epochs: {epochs} | Batch: {batch_size} | Workers: {num_workers}")
+    print(f" Target Device: {device} | Model: {model_type} | CMVN: {use_cmvn} | Epochs: {epochs} | Batch: {batch_size}")
     print(f"=======================================================\n")
 
     CHECKPOINTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -87,9 +89,14 @@ def run_training(
         batch_size=batch_size,
         num_workers=num_workers,
         pin_memory=(device.type == "cuda"),
+        use_cmvn=use_cmvn,
     )
 
-    model = AudioCNN().to(device)
+    if model_type == "se_cnn":
+        model = SEAudioCNN().to(device)
+    else:
+        model = AudioCNN().to(device)
+
     criterion = nn.CrossEntropyLoss()
     optimizer = Adam(model.parameters(), lr=lr, weight_decay=WEIGHT_DECAY)
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs)
@@ -125,6 +132,8 @@ def run_training(
                     "val_macro_f1": val_f1,
                     "per_class_f1": per_class_f1,
                     "test_fold": test_fold,
+                    "model_type": model_type,
+                    "use_cmvn": use_cmvn,
                 },
                 best_checkpoint,
             )
@@ -138,7 +147,13 @@ def run_training(
         val_accuracy=best_data["val_accuracy"],
         val_macro_f1=best_data["val_macro_f1"],
         per_class_f1=best_data["per_class_f1"],
-        hyperparameters={"lr": lr, "batch_size": batch_size, "weight_decay": WEIGHT_DECAY},
+        hyperparameters={
+            "lr": lr,
+            "batch_size": batch_size,
+            "weight_decay": WEIGHT_DECAY,
+            "model_type": model_type,
+            "use_cmvn": use_cmvn,
+        },
         checkpoint_path=str(best_checkpoint),
     )
     print(f"\nTraining for Fold {test_fold} Completed! Best Macro-F1: {best_val_f1:.4f}\n")
@@ -150,17 +165,20 @@ def run_training(
     }
 
 
+
 def run_cross_validation(
     folds: List[int] = list(range(1, 11)),
     epochs: int = DEFAULT_EPOCHS,
     batch_size: int = BATCH_SIZE,
     lr: float = LEARNING_RATE,
     skip_existing: bool = False,
+    model_type: str = "baseline",
+    use_cmvn: bool = False,
 ) -> Dict[str, Any]:
     tracker = RufloExperimentTracker()
     print("\n" + "=" * 65)
     print(f" Starting Full 10-Fold Cross-Validation on UrbanSound8K")
-    print(f" Target Folds: {folds} | Epochs per fold: {epochs} | Batch: {batch_size}")
+    print(f" Target Folds: {folds} | Model: {model_type} | CMVN: {use_cmvn} | Epochs per fold: {epochs} | Batch: {batch_size}")
     print("=" * 65 + "\n")
 
     results = []
@@ -180,7 +198,14 @@ def run_cross_validation(
             except Exception:
                 pass
 
-        res = run_training(test_fold=f, epochs=epochs, batch_size=batch_size, lr=lr)
+        res = run_training(
+            test_fold=f,
+            epochs=epochs,
+            batch_size=batch_size,
+            lr=lr,
+            model_type=model_type,
+            use_cmvn=use_cmvn,
+        )
         results.append(res)
 
     summary = tracker.get_cv_summary()
@@ -202,14 +227,40 @@ if __name__ == "__main__":
     parser.add_argument("--all-folds", action="store_true", help="Run 10-fold cross validation across all folds (1-10)")
     parser.add_argument("--folds", type=int, nargs="+", default=None, help="Explicit list of folds to train (e.g. --folds 2 3 4)")
     parser.add_argument("--skip-existing", action="store_true", help="Skip folds with existing checkpoints")
+    parser.add_argument("--model-type", type=str, default="baseline", choices=["baseline", "se_cnn"], help="Backbone architecture (baseline or se_cnn)")
+    parser.add_argument("--use-cmvn", action="store_true", help="Apply Per-Channel Cepstral Mean & Variance Normalization")
     parser.add_argument("--epochs", type=int, default=5, help="Number of training epochs per fold")
     parser.add_argument("--batch-size", type=int, default=32, help="Batch size")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     args = parser.parse_args()
 
     if args.all_folds:
-        run_cross_validation(folds=list(range(1, 11)), epochs=args.epochs, batch_size=args.batch_size, lr=args.lr, skip_existing=args.skip_existing)
+        run_cross_validation(
+            folds=list(range(1, 11)),
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            lr=args.lr,
+            skip_existing=args.skip_existing,
+            model_type=args.model_type,
+            use_cmvn=args.use_cmvn,
+        )
     elif args.folds:
-        run_cross_validation(folds=args.folds, epochs=args.epochs, batch_size=args.batch_size, lr=args.lr, skip_existing=args.skip_existing)
+        run_cross_validation(
+            folds=args.folds,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            lr=args.lr,
+            skip_existing=args.skip_existing,
+            model_type=args.model_type,
+            use_cmvn=args.use_cmvn,
+        )
     else:
-        run_training(test_fold=args.fold, epochs=args.epochs, batch_size=args.batch_size, lr=args.lr)
+        run_training(
+            test_fold=args.fold,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            lr=args.lr,
+            model_type=args.model_type,
+            use_cmvn=args.use_cmvn,
+        )
+

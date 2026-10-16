@@ -17,10 +17,12 @@ from tqdm import tqdm
 
 from pipeline.config import BASE_DIR, CHECKPOINTS_DIR
 from pipeline.audio_loader import load_and_preprocess_audio, compute_log_mel_spectrogram
-from pipeline.speaker_id import SpeakerEmbeddingNet
+from pipeline.speaker_id import SpeakerEmbeddingNet, SESpeakerEmbeddingNet
+from pipeline.model import ArcMarginProduct
 from pipeline.dataset import SpecAugment
 from pipeline.device import get_device
 from pipeline.ruflo_tracker import RufloExperimentTracker
+
 
 
 from collections import OrderedDict
@@ -28,7 +30,7 @@ from collections import OrderedDict
 
 class VoxCelebDataset(Dataset):
     """Dataset for VoxCeleb audio files with bounded LRU spectrogram caching."""
-    _CACHE_LRU: OrderedDict[str, np.ndarray] = OrderedDict()
+    _CACHE_LRU: "OrderedDict[str, np.ndarray]" = OrderedDict()
     _MAX_CACHE_SIZE: int = 3000
 
     def __init__(self, file_paths: List[Path], labels: List[int], augment: bool = False):
@@ -64,18 +66,51 @@ class VoxCelebDataset(Dataset):
 class SpeakerCosineClassifier(nn.Module):
     """Wrapper that combines the 128-d SpeakerEmbeddingNet with a normalized Cosine Linear head."""
 
-    def __init__(self, embedding_net: SpeakerEmbeddingNet, num_classes: int, scale: float = 16.0):
+    def __init__(self, embedding_net: nn.Module, num_classes: int, scale: float = 16.0):
         super().__init__()
         self.embedding_net = embedding_net
         self.scale = scale
         self.classifier = nn.Linear(128, num_classes, bias=False)
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor, label: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         emb = self.embedding_net(x)
         # Normalize classifier weights so dot product equals cosine similarity
         weight_norm = F.normalize(self.classifier.weight, p=2, dim=-1)
         logits = F.linear(emb, weight_norm) * self.scale
         return logits, emb
+
+
+class SpeakerArcFaceClassifier(nn.Module):
+    """Wrapper that combines the 128-d SpeakerEmbeddingNet with an ArcFace / AAM-Softmax loss head."""
+
+    def __init__(
+        self,
+        embedding_net: nn.Module,
+        num_classes: int,
+        scale: float = 30.0,
+        margin: float = 0.30,
+        easy_margin: bool = False,
+    ):
+        super().__init__()
+        self.embedding_net = embedding_net
+        self.scale = scale
+        self.arc_margin = ArcMarginProduct(
+            in_features=128,
+            out_features=num_classes,
+            scale=scale,
+            margin=margin,
+            easy_margin=easy_margin,
+        )
+
+    def forward(self, x: torch.Tensor, label: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        emb = self.embedding_net(x)
+        if label is not None:
+            logits = self.arc_margin(emb, label)
+        else:
+            cosine = F.linear(emb, F.normalize(self.arc_margin.weight, p=2, dim=-1))
+            logits = cosine * self.scale
+        return logits, emb
+
 
 
 def get_voxceleb_dataloaders(
@@ -152,7 +187,10 @@ def train_one_epoch(
         labels = labels.to(device, non_blocking=True)
 
         optimizer.zero_grad()
-        logits, _ = model(specs)
+        if isinstance(model, SpeakerArcFaceClassifier):
+            logits, _ = model(specs, labels)
+        else:
+            logits, _ = model(specs)
         loss = criterion(logits, labels)
         loss.backward()
         optimizer.step()
@@ -206,11 +244,16 @@ def run_speaker_training(
     epochs: int = 5,
     batch_size: int = 64,
     lr: float = 1e-3,
+    backbone: str = "se_resnet",
+    loss_type: str = "arcface",
+    scale: float = 30.0,
+    margin: float = 0.30,
 ) -> Dict[str, Any]:
     device = get_device()
     print(f"\n=======================================================")
     print(f" Starting VoxCeleb Speaker Embedding Network Training")
-    print(f" Target Device: {device} | Max Speakers: {max_speakers} | Max Files/Spk: {max_files_per_speaker} | Epochs: {epochs} | Batch: {batch_size}")
+    print(f" Target Device: {device} | Backbone: {backbone} | Loss: {loss_type} | Margin: {margin} | Scale: {scale}")
+    print(f" Max Speakers: {max_speakers} | Max Files/Spk: {max_files_per_speaker} | Epochs: {epochs} | Batch: {batch_size}")
     print(f"=======================================================\n")
 
     CHECKPOINTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -218,8 +261,15 @@ def run_speaker_training(
         max_speakers=max_speakers, max_files_per_speaker=max_files_per_speaker, batch_size=batch_size
     )
 
-    embedding_net = SpeakerEmbeddingNet().to(device)
-    model = SpeakerCosineClassifier(embedding_net, num_classes=num_classes).to(device)
+    embedding_net = SpeakerEmbeddingNet(backbone=backbone).to(device)
+    if loss_type == "arcface":
+        model = SpeakerArcFaceClassifier(
+            embedding_net, num_classes=num_classes, scale=scale, margin=margin
+        ).to(device)
+    else:
+        model = SpeakerCosineClassifier(
+            embedding_net, num_classes=num_classes, scale=scale
+        ).to(device)
 
     criterion = nn.CrossEntropyLoss()
     optimizer = Adam(model.parameters(), lr=lr, weight_decay=1e-4)
@@ -256,6 +306,8 @@ def run_speaker_training(
                     "top5_accuracy": top5_acc,
                     "num_speakers": num_classes,
                     "speaker_names": speaker_names,
+                    "backbone": backbone,
+                    "loss": loss_type,
                 },
                 best_checkpoint,
             )
@@ -267,8 +319,17 @@ def run_speaker_training(
         epochs=epochs,
         val_accuracy=best_top1_acc,
         val_macro_f1=best_top1_acc,
-        per_class_f1={"top1_accuracy": best_top1_acc},
-        hyperparameters={"max_speakers": num_classes, "max_files_per_speaker": max_files_per_speaker, "lr": lr, "batch_size": batch_size},
+        per_class_f1={"top1_accuracy": best_top1_acc, "top5_accuracy": top5_acc},
+        hyperparameters={
+            "max_speakers": num_classes,
+            "max_files_per_speaker": max_files_per_speaker,
+            "lr": lr,
+            "batch_size": batch_size,
+            "backbone": backbone,
+            "loss": loss_type,
+            "scale": scale,
+            "margin": margin,
+        },
         checkpoint_path=str(best_checkpoint),
     )
 
@@ -287,6 +348,10 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=5, help="Number of training epochs")
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
+    parser.add_argument("--backbone", type=str, default="se_resnet", choices=["baseline", "se_resnet", "depthwise"], help="Backbone feature extractor")
+    parser.add_argument("--loss", type=str, default="arcface", choices=["arcface", "cosine_ce"], help="Loss formulation (arcface or cosine_ce)")
+    parser.add_argument("--scale", type=float, default=30.0, help="ArcFace / Cosine scaling factor")
+    parser.add_argument("--margin", type=float, default=0.30, help="ArcFace angular margin m in radians")
     args = parser.parse_args()
 
     run_speaker_training(
@@ -295,4 +360,9 @@ if __name__ == "__main__":
         epochs=args.epochs,
         batch_size=args.batch_size,
         lr=args.lr,
+        backbone=args.backbone,
+        loss_type=args.loss,
+        scale=args.scale,
+        margin=args.margin,
     )
+

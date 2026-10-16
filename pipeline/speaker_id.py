@@ -13,52 +13,12 @@ from pipeline.audio_loader import load_and_preprocess_audio, compute_log_mel_spe
 from pipeline.device import get_device
 
 
-class TemporalStatsPooling(nn.Module):
-    """Computes mean and standard deviation across the temporal dimension (x-vector standard)."""
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, C, F, T = x.shape
-        x_flat = x.view(B, C * F, T)
-        mean = torch.mean(x_flat, dim=-1)
-        std = torch.std(x_flat, dim=-1)
-        return torch.cat([mean, std], dim=1)
-
-
-class SpeakerEmbeddingNet(nn.Module):
-    """Deep Speaker Verification Network producing normalized 128-d voiceprint embeddings."""
-
-    def __init__(self, embedding_dim: int = 128):
-        super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(1, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=(2, 2)),
-            
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=(2, 2)),
-
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=(2, 2)),
-        )
-        # Stats pooling over reduced frequency and time bins
-        # 128 channels * 16 freq bins = 2048 dims * 2 (mean+std) = 4096 dims
-        self.stats_pool = TemporalStatsPooling()
-        self.projection = nn.Sequential(
-            nn.Linear(128 * 16 * 2, 256),
-            nn.BatchNorm1d(256),
-            nn.ReLU(inplace=True),
-            nn.Linear(256, embedding_dim),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        feat = self.conv(x)
-        stats = self.stats_pool(feat)
-        embedding = self.projection(stats)
-        return F.normalize(embedding, p=2, dim=-1)
+from pipeline.model import (
+    TemporalStatsPooling,
+    SpeakerEmbeddingNet,
+    SESpeakerEmbeddingNet,
+    ArcMarginProduct,
+)
 
 
 class SpeakerIdentifier:

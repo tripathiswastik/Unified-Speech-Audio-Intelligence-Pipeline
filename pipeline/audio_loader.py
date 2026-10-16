@@ -4,7 +4,7 @@ Provides both full-length audio loading for diarization/conversations and fixed-
 preprocessing for convolutional classification networks.
 """
 from pathlib import Path
-from typing import Tuple, Dict, Optional
+from typing import Tuple, Dict, Optional, Any
 import numpy as np
 import soundfile as sf
 import librosa
@@ -115,3 +115,55 @@ def compute_log_mel_spectrogram(waveform: np.ndarray, sr: int = SAMPLE_RATE) -> 
     else:
         log_mel = log_mel - mean
     return log_mel.astype(np.float32)
+
+
+def compute_cmvn_log_mel_spectrogram(waveform: np.ndarray, sr: int = SAMPLE_RATE) -> np.ndarray:
+    """Extract Log-Mel Spectrogram with Per-Channel Cepstral Mean & Variance Normalization (CMVN).
+    
+    Normalizes each Mel frequency channel independently across time, effectively suppressing
+    stationary background environmental noise and channel frequency coloration.
+    """
+    mel_basis = get_mel_filterbank(sr, N_FFT, N_MELS)
+    stft = librosa.stft(waveform, n_fft=N_FFT, hop_length=HOP_LENGTH)
+    power = np.abs(stft) ** 2
+    mel_spec = np.dot(mel_basis, power)
+    log_mel = librosa.power_to_db(mel_spec, ref=np.max)
+
+    channel_mean = np.mean(log_mel, axis=1, keepdims=True)
+    channel_std = np.std(log_mel, axis=1, keepdims=True)
+    channel_std = np.where(channel_std > 1e-6, channel_std, 1.0)
+    norm_mel = (log_mel - channel_mean) / channel_std
+    return norm_mel.astype(np.float32)
+
+
+def extract_ssl_features(
+    waveform: np.ndarray,
+    model_name: str = "facebook/wav2vec2-base",
+    device: Optional[Any] = None,
+) -> Optional[np.ndarray]:
+    """Extract Self-Supervised Learning (SSL) representations (wav2vec 2.0 / HuBERT).
+
+    Loads a pretrained SSL transformer from Hugging Face, freezes its parameters,
+    and extracts frame-level hidden state features. Returns None if transformers is unavailable.
+    """
+    try:
+        from transformers import AutoModel
+        import torch
+
+        if device is None:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        model = AutoModel.from_pretrained(model_name).to(device)
+        model.eval()
+        for p in model.parameters():
+            p.requires_grad = False
+
+        tensor_wave = torch.from_numpy(waveform).float().unsqueeze(0).to(device)
+        with torch.no_grad():
+            outputs = model(tensor_wave)
+            hidden_states = outputs.last_hidden_state.squeeze(0).cpu().numpy()
+        return hidden_states
+    except Exception:
+        return None
+
+

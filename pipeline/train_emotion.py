@@ -11,7 +11,7 @@ from tqdm import tqdm
 
 from pipeline.config import CHECKPOINTS_DIR, OUTPUT_DIR
 from pipeline.emotion_dataset import get_emotion_dataloaders, EMOTIONS
-from pipeline.emotion_model import EmotionClassifierCNN
+from pipeline.emotion_model import EmotionClassifierCNN, SEEmotionClassifierCNN, SSLEmotionClassifier
 from pipeline.ruflo_tracker import RufloExperimentTracker
 
 
@@ -64,11 +64,12 @@ def run_emotion_training(
     batch_size: int = 32,
     lr: float = 1e-3,
     use_noise_aug: bool = True,
+    model_type: str = "baseline",
 ):
     device = get_device()
     print(f"\n=======================================================")
     print(f" Starting Speech Emotion Recognition (SER) Training")
-    print(f" Target Device: {device} | UrbanSound8K Noise: {use_noise_aug}")
+    print(f" Target Device: {device} | Model: {model_type} | UrbanSound8K Noise: {use_noise_aug}")
     print(f" Epochs: {epochs} | Batch Size: {batch_size}")
     print(f"=======================================================\n")
 
@@ -77,12 +78,20 @@ def run_emotion_training(
     )
     train_loader, val_loader = dataloaders[0], dataloaders[1]
 
-    model = EmotionClassifierCNN().to(device)
+    if model_type == "se_cnn":
+        model = SEEmotionClassifierCNN().to(device)
+    elif model_type == "ssl":
+        model = SSLEmotionClassifier().to(device)
+    else:
+        model = EmotionClassifierCNN().to(device)
+
     criterion = nn.CrossEntropyLoss()
     optimizer = Adam(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs)
 
     best_val_f1 = 0.0
+    best_val_acc = 0.0
+    best_per_class = {}
     best_checkpoint = CHECKPOINTS_DIR / "best_emotion_model.pt"
     tracker = RufloExperimentTracker(experiment_name="speech_emotion_recognition_urban_augmented")
 
@@ -105,6 +114,8 @@ def run_emotion_training(
 
         if val_f1 > best_val_f1:
             best_val_f1 = val_f1
+            best_val_acc = val_acc
+            best_per_class = per_class
             torch.save(
                 {
                     "epoch": epoch,
@@ -112,12 +123,34 @@ def run_emotion_training(
                     "val_accuracy": val_acc,
                     "val_macro_f1": val_f1,
                     "per_class_f1": per_class,
+                    "model_type": model_type,
                 },
                 best_checkpoint,
             )
             print(f"  --> Saved new best emotion model to {best_checkpoint.name} (F1: {val_f1:.4f})")
 
+    # Record emotion training run in Ruflo tracker
+    tracker.log_run(
+        fold=0,
+        epochs=epochs,
+        val_accuracy=best_val_acc,
+        val_macro_f1=best_val_f1,
+        per_class_f1=best_per_class,
+        hyperparameters={
+            "lr": lr,
+            "batch_size": batch_size,
+            "use_noise_aug": use_noise_aug,
+            "model_type": model_type,
+        },
+        checkpoint_path=str(best_checkpoint),
+    )
+
     print(f"\nEmotion Training Complete! Best Validation Macro-F1: {best_val_f1:.4f}\n")
+    return {
+        "val_accuracy": best_val_acc,
+        "val_macro_f1": best_val_f1,
+        "checkpoint": str(best_checkpoint),
+    }
 
 
 if __name__ == "__main__":
@@ -126,6 +159,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, default=32, help="Batch size")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     parser.add_argument("--no-noise", action="store_true", help="Disable UrbanSound8K noise augmentation")
+    parser.add_argument("--model-type", type=str, default="baseline", choices=["baseline", "se_cnn", "ssl"], help="Model backbone architecture")
     args = parser.parse_args()
 
     run_emotion_training(
@@ -133,4 +167,6 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         lr=args.lr,
         use_noise_aug=not args.no_noise,
+        model_type=args.model_type,
     )
+

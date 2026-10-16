@@ -8,10 +8,15 @@ from torch.utils.data import Dataset, DataLoader
 
 from collections import OrderedDict
 from pipeline.config import AUDIO_DIR, METADATA_CSV, CACHE_DIR
-from pipeline.audio_loader import load_and_preprocess_audio, compute_log_mel_spectrogram
+from pipeline.audio_loader import (
+    load_and_preprocess_audio,
+    compute_log_mel_spectrogram,
+    compute_cmvn_log_mel_spectrogram,
+)
 
 
 class SpecAugment:
+
     """SpecAugment data augmentation: Frequency and Time masking on Mel-spectrograms."""
     def __init__(self, freq_mask_param: int = 16, time_mask_param: int = 24):
         self.freq_mask_param = freq_mask_param
@@ -38,7 +43,7 @@ class UrbanSoundDataset(Dataset):
     """UrbanSound8K Dataset partitioned strictly by official folds to prevent leakage.
     Features dual-tier bounded LRU memory cache and disk-backed .npy storage.
     """
-    _LRU_CACHE: OrderedDict[str, np.ndarray] = OrderedDict()
+    _LRU_CACHE: "OrderedDict[str, np.ndarray]" = OrderedDict()
     _MAX_LRU_ENTRIES: int = 2000  # ~170 MB max memory footprint
 
     def __init__(
@@ -48,15 +53,17 @@ class UrbanSoundDataset(Dataset):
         audio_dir: Path = AUDIO_DIR,
         augment: bool = False,
         cache_to_disk: bool = True,
+        use_cmvn: bool = False,
     ):
         self.audio_dir = Path(audio_dir)
         raw_df = pd.read_csv(metadata_csv)
         assert isinstance(raw_df, pd.DataFrame)
         self.df: pd.DataFrame = raw_df[raw_df["fold"].isin(folds)].reset_index(drop=True)
         self.augment = augment
+        self.use_cmvn = use_cmvn
         self.spec_augment = SpecAugment() if augment else None
         self.cache_to_disk = cache_to_disk
-        self.disk_cache_dir = CACHE_DIR / "specs"
+        self.disk_cache_dir = CACHE_DIR / ("specs_cmvn" if use_cmvn else "specs")
         if self.cache_to_disk:
             self.disk_cache_dir.mkdir(parents=True, exist_ok=True)
 
@@ -67,7 +74,7 @@ class UrbanSoundDataset(Dataset):
         row = self.df.iloc[index]
         fold = int(row["fold"])
         file_name = str(row["slice_file_name"])
-        cache_key = f"{fold}_{file_name}"
+        cache_key = f"{fold}_{file_name}_cmvn" if self.use_cmvn else f"{fold}_{file_name}"
 
         # 1. Tier 1: Check Bounded In-Memory LRU Cache
         if cache_key in self._LRU_CACHE:
@@ -87,7 +94,10 @@ class UrbanSoundDataset(Dataset):
             if spec is None:
                 file_path = self.audio_dir / f"fold{fold}" / file_name
                 waveform = load_and_preprocess_audio(file_path)
-                spec = compute_log_mel_spectrogram(waveform)
+                if self.use_cmvn:
+                    spec = compute_cmvn_log_mel_spectrogram(waveform)
+                else:
+                    spec = compute_log_mel_spectrogram(waveform)
                 if self.cache_to_disk:
                     try:
                         np.save(str(disk_path), spec)
@@ -114,13 +124,14 @@ def get_dataloaders(
     batch_size: int = 32,
     num_workers: int = 0,
     pin_memory: Optional[bool] = None,
+    use_cmvn: bool = False,
 ) -> Tuple[DataLoader, DataLoader]:
     """Create train and validation DataLoaders using official 10-fold split with memory pinning."""
     train_folds = [f for f in range(1, 11) if f != test_fold]
     val_folds = [test_fold]
 
-    train_ds = UrbanSoundDataset(folds=train_folds, augment=True)
-    val_ds = UrbanSoundDataset(folds=val_folds, augment=False)
+    train_ds = UrbanSoundDataset(folds=train_folds, augment=True, use_cmvn=use_cmvn)
+    val_ds = UrbanSoundDataset(folds=val_folds, augment=False, use_cmvn=use_cmvn)
 
     use_pin = pin_memory if pin_memory is not None else torch.cuda.is_available()
 
