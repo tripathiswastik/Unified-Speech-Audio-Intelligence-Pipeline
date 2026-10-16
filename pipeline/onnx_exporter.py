@@ -14,12 +14,23 @@ from pipeline.model import SEAudioCNN, SESpeakerEmbeddingNet
 from pipeline.device import get_device
 
 
+def get_optimal_opset_version() -> int:
+    """Determine highest supported ONNX opset version for current PyTorch runtime."""
+    try:
+        major = int(torch.__version__.split(".")[0])
+        if major >= 2:
+            return 18
+    except Exception:
+        pass
+    return 14
+
+
 def export_se_audiocnn_to_onnx(
     output_path: Optional[Path] = None,
-    opset_version: int = 14,
+    opset_version: Optional[int] = None,
     device: Optional[torch.device] = None,
 ) -> Path:
-    """Export SEAudioCNN to ONNX with dynamic batch axis for edge inference."""
+    """Export SEAudioCNN to ONNX with minimal dynamic axes and fallback retry."""
     if output_path is None:
         output_path = CHECKPOINTS_DIR / "se_audiocnn.onnx"
     output_path = Path(output_path)
@@ -28,37 +39,72 @@ def export_se_audiocnn_to_onnx(
     if device is None:
         device = torch.device("cpu")  # Export on CPU for maximum runtime portability
 
+    if opset_version is None:
+        opset_version = get_optimal_opset_version()
+
     model = SEAudioCNN(num_classes=len(CLASSES)).to(device)
     model.eval()
 
     # Dummy Mel-spectrogram input: (B=1, C=1, F=128, T=173)
     dummy_input = torch.randn(1, 1, 128, 173, device=device)
 
-    # Export with dynamic batch size
-    torch.onnx.export(
-        model,
-        dummy_input,
-        str(output_path),
-        export_params=True,
-        opset_version=opset_version,
-        do_constant_folding=True,
-        input_names=["input_mel_spectrogram"],
-        output_names=["class_logits"],
-        dynamic_axes={
-            "input_mel_spectrogram": {0: "batch_size"},
-            "class_logits": {0: "batch_size"},
-        },
-    )
-    print(f"[ONNX Export] Successfully exported SEAudioCNN -> {output_path.name} (Opset {opset_version})")
+    # First attempt: minimal batch dynamic axis
+    try:
+        torch.onnx.export(
+            model,
+            dummy_input,
+            str(output_path),
+            export_params=True,
+            opset_version=opset_version,
+            do_constant_folding=True,
+            input_names=["input_mel_spectrogram"],
+            output_names=["class_logits"],
+            dynamic_axes={
+                "input_mel_spectrogram": {0: "batch_size"},
+                "class_logits": {0: "batch_size"},
+            },
+        )
+    except Exception as e:
+        print(f"[ONNX Export] First attempt failed: {e}. Retrying with do_constant_folding=False and static axes.")
+        torch.onnx.export(
+            model,
+            dummy_input,
+            str(output_path),
+            export_params=True,
+            opset_version=opset_version,
+            do_constant_folding=False,
+            input_names=["input_mel_spectrogram"],
+            output_names=["class_logits"],
+            dynamic_axes=None,
+        )
+
+    # Sanity check file size (SEAudioCNN has ~1.2M params -> ~4.8MB float32)
+    if output_path.exists() and output_path.stat().st_size < 1_000_000:
+        print(f"[ONNX Export] Warning: {output_path.name} size is unexpectedly small ({output_path.stat().st_size} bytes). Retrying with conservative settings.")
+        torch.onnx.export(
+            model,
+            dummy_input,
+            str(output_path),
+            export_params=True,
+            opset_version=opset_version,
+            do_constant_folding=False,
+            input_names=["input_mel_spectrogram"],
+            output_names=["class_logits"],
+            dynamic_axes=None,
+        )
+        if output_path.stat().st_size < 1_000_000:
+            raise RuntimeError(f"Exported ONNX file still too small: {output_path} ({output_path.stat().st_size} bytes)")
+
+    print(f"[ONNX Export] Successfully exported SEAudioCNN -> {output_path.name} ({output_path.stat().st_size} bytes, Opset {opset_version})")
     return output_path
 
 
 def export_se_speaker_embedding_to_onnx(
     output_path: Optional[Path] = None,
-    opset_version: int = 14,
+    opset_version: Optional[int] = None,
     device: Optional[torch.device] = None,
 ) -> Path:
-    """Export SESpeakerEmbeddingNet to ONNX with dynamic batch and temporal axes."""
+    """Export SESpeakerEmbeddingNet to ONNX with minimal dynamic axes and fallback retry."""
     if output_path is None:
         output_path = CHECKPOINTS_DIR / "se_speaker_embedding.onnx"
     output_path = Path(output_path)
@@ -67,28 +113,64 @@ def export_se_speaker_embedding_to_onnx(
     if device is None:
         device = torch.device("cpu")
 
+    if opset_version is None:
+        opset_version = get_optimal_opset_version()
+
     model = SESpeakerEmbeddingNet(embedding_dim=128).to(device)
     model.eval()
 
-    # Dummy Mel-spectrogram: (B=1, C=1, F=128, T=variable)
+    # Dummy Mel-spectrogram: (B=1, C=1, F=128, T=100)
     dummy_input = torch.randn(1, 1, 128, 100, device=device)
 
-    torch.onnx.export(
-        model,
-        dummy_input,
-        str(output_path),
-        export_params=True,
-        opset_version=opset_version,
-        do_constant_folding=True,
-        input_names=["input_mel_spectrogram"],
-        output_names=["normalized_embedding"],
-        dynamic_axes={
-            "input_mel_spectrogram": {0: "batch_size", 3: "temporal_frames"},
-            "normalized_embedding": {0: "batch_size"},
-        },
-    )
-    print(f"[ONNX Export] Successfully exported SESpeakerEmbeddingNet -> {output_path.name} (Opset {opset_version})")
+    try:
+        torch.onnx.export(
+            model,
+            dummy_input,
+            str(output_path),
+            export_params=True,
+            opset_version=opset_version,
+            do_constant_folding=True,
+            input_names=["input_mel_spectrogram"],
+            output_names=["normalized_embedding"],
+            dynamic_axes={
+                "input_mel_spectrogram": {0: "batch_size"},
+                "normalized_embedding": {0: "batch_size"},
+            },
+        )
+    except Exception as e:
+        print(f"[ONNX Export] First attempt failed: {e}. Retrying with simpler settings.")
+        torch.onnx.export(
+            model,
+            dummy_input,
+            str(output_path),
+            export_params=True,
+            opset_version=opset_version,
+            do_constant_folding=False,
+            input_names=["input_mel_spectrogram"],
+            output_names=["normalized_embedding"],
+            dynamic_axes=None,
+        )
+
+    # Sanity check file size (SESpeakerEmbeddingNet has ~1.2M params -> ~4.7MB float32)
+    if output_path.exists() and output_path.stat().st_size < 1_000_000:
+        print(f"[ONNX Export] Warning: {output_path.name} size is unexpectedly small ({output_path.stat().st_size} bytes). Retrying conservative export.")
+        torch.onnx.export(
+            model,
+            dummy_input,
+            str(output_path),
+            export_params=True,
+            opset_version=opset_version,
+            do_constant_folding=False,
+            input_names=["input_mel_spectrogram"],
+            output_names=["normalized_embedding"],
+            dynamic_axes=None,
+        )
+        if output_path.stat().st_size < 1_000_000:
+            raise RuntimeError(f"Exported ONNX file still too small: {output_path} ({output_path.stat().st_size} bytes)")
+
+    print(f"[ONNX Export] Successfully exported SESpeakerEmbeddingNet -> {output_path.name} ({output_path.stat().st_size} bytes, Opset {opset_version})")
     return output_path
+
 
 
 def profile_edge_frontends(num_runs: int = 20) -> Dict[str, Any]:

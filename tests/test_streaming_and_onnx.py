@@ -109,17 +109,17 @@ class TestONNXExportAndEdgeProfiles:
         spk_onnx = CHECKPOINTS_DIR / "se_speaker_embedding.onnx"
 
         try:
-            if not audio_onnx.exists():
+            if not audio_onnx.exists() or audio_onnx.stat().st_size < 1_000_000:
                 export_se_audiocnn_to_onnx(audio_onnx)
-            if not spk_onnx.exists():
+            if not spk_onnx.exists() or spk_onnx.stat().st_size < 1_000_000:
                 export_se_speaker_embedding_to_onnx(spk_onnx)
         except Exception as e:
             pytest.skip(f"ONNX export not supported in current environment: {e}")
 
         assert audio_onnx.exists(), f"Missing ONNX file: {audio_onnx}"
         assert spk_onnx.exists(), f"Missing ONNX file: {spk_onnx}"
-        assert audio_onnx.stat().st_size > 1_000_000, "SEAudioCNN ONNX size too small"
-        assert spk_onnx.stat().st_size > 1_000_000, "SESpeakerEmbeddingNet ONNX size too small"
+        assert audio_onnx.stat().st_size > 1_000_000, f"SEAudioCNN ONNX size too small: {audio_onnx.stat().st_size} bytes"
+        assert spk_onnx.stat().st_size > 1_000_000, f"SESpeakerEmbeddingNet ONNX size too small: {spk_onnx.stat().st_size} bytes"
 
     def test_edge_profiling_latency(self):
         profiles = profile_edge_frontends(num_runs=5)
