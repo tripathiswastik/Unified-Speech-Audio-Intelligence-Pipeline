@@ -50,9 +50,9 @@ def evaluate_emotion(model, loader, criterion, device):
             all_preds.extend(preds)
             all_targets.extend(labels.cpu().numpy())
 
-    avg_loss = total_loss / len(loader.dataset)
-    acc = accuracy_score(all_targets, all_preds)
-    macro_f1 = f1_score(all_targets, all_preds, average="macro", zero_division=0)
+    avg_loss = float(total_loss / len(loader.dataset))
+    acc = float(accuracy_score(all_targets, all_preds))
+    macro_f1 = float(f1_score(all_targets, all_preds, average="macro", zero_division=0))
     per_class_f1_arr = np.asarray(f1_score(all_targets, all_preds, average=None, zero_division=0))
     per_class_f1 = {EMOTIONS[i]: float(per_class_f1_arr[i]) for i in range(len(EMOTIONS))}
 
@@ -133,8 +133,8 @@ def run_emotion_training(
     tracker.log_run(
         fold=0,
         epochs=epochs,
-        val_accuracy=best_val_acc,
-        val_macro_f1=best_val_f1,
+        val_accuracy=float(best_val_acc),
+        val_macro_f1=float(best_val_f1),
         per_class_f1=best_per_class,
         hyperparameters={
             "lr": lr,

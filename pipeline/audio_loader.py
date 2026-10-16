@@ -147,7 +147,9 @@ def extract_ssl_features(
     and extracts frame-level hidden state features. Returns None if transformers is unavailable.
     """
     try:
-        from transformers import AutoModel
+        import importlib
+        transformers_mod = importlib.import_module("transformers")
+        AutoModel = getattr(transformers_mod, "AutoModel")
         import torch
 
         if device is None:
