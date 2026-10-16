@@ -628,6 +628,7 @@ def main():
     parser.add_argument("--val-fold", type=int, default=10, help="UrbanSound8K validation fold (1-10)")
     parser.add_argument("--max-speakers", type=int, default=50, help="Max VoxCeleb speakers for training")
     parser.add_argument("--max-steps-per-epoch", type=int, default=None, help="Cap training steps per epoch for fast smoke testing")
+    parser.add_argument("--max-val-batches", type=int, default=None, help="Cap validation batches per epoch (runs full validation on final epoch)")
     parser.add_argument("--smoke-test", action="store_true", help="Run 2-epoch smoke-training job with checkpoint reload verification")
     parser.add_argument("--export-onnx", action="store_true", default=True, help="Export static ONNX on completion")
     args = parser.parse_args()
@@ -750,6 +751,9 @@ def main():
         scheduler.step()
         epoch_loss_history.append(losses["total"])
 
+        is_final_epoch = (epoch == args.epochs)
+        cur_max_val = 5 if args.smoke_test else (None if is_final_epoch else args.max_val_batches)
+        cur_spk_pairs = 10 if args.smoke_test else (100 if is_final_epoch else (20 if args.max_val_batches else 100))
         val_metrics = evaluate_multitask(
             model=model,
             arc_margin=arc_margin,
@@ -758,8 +762,8 @@ def main():
             loader_ravdess_val=loader_ravdess_val,
             device=device,
             ds_vox_val=ds_vox_val,
-            max_val_batches=5 if args.smoke_test else None,
-            num_spk_pairs=10 if args.smoke_test else 100,
+            max_val_batches=cur_max_val,
+            num_spk_pairs=cur_spk_pairs,
         )
 
         comp = val_metrics["composite_score"]
