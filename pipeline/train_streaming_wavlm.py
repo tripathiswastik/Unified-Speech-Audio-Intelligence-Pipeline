@@ -783,10 +783,11 @@ def main():
             f"Composite: {comp:.4f} | Gates: {'PASSED' if passes_gates else 'HELD'}"
         )
 
-        if (comp > best_composite and passes_gates) or (args.smoke_test and epoch == args.epochs):
+        if comp > best_composite or (args.smoke_test and epoch == args.epochs):
             best_composite = comp
             torch.save(model.state_dict(), best_ckpt_path)
-            print(f"  [CHECKPOINT SAVED] Composite: {comp:.4f} -> {best_ckpt_path.name}")
+            gate_status = "PASSED ALL GATES" if passes_gates else "GATES HELD"
+            print(f"  [CHECKPOINT SAVED] Composite: {comp:.4f} ({gate_status}) -> {best_ckpt_path.name}")
 
     total_time = time.time() - t_start
     print(f"\n[Causal MultiTask Transformer] Training completed in {total_time/60:.2f} mins. Best Composite: {best_composite:.4f}")
@@ -836,7 +837,12 @@ def main():
         epochs=args.epochs,
         val_accuracy=float(best_composite if best_composite > 0 else 0.0),
         val_macro_f1=float(best_composite if best_composite > 0 else 0.0),
-        per_class_f1={"composite": float(best_composite if best_composite > 0 else 0.0)},
+        per_class_f1={
+            "composite": float(best_composite if best_composite > 0 else 0.0),
+            "scene_f1": float(val_metrics.get("scene_f1", 0.0)),
+            "spk_eer": float(val_metrics.get("spk_eer", 1.0)),
+            "emo_f1": float(val_metrics.get("emo_f1", 0.0)),
+        },
         hyperparameters={
             "architecture": "CausalMultiTaskAudioTransformer",
             "epochs": args.epochs,

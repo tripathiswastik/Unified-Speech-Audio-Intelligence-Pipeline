@@ -34,3 +34,7 @@ dev = [
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 addopts = "-v"
+filterwarnings = [
+    "ignore:.*The shape inference of prim..Constant type is missing.*:UserWarning",
+    "ignore:.*Constant folding - Only steps=1 can be constant folded.*:UserWarning",
+]
