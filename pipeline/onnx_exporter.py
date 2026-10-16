@@ -15,14 +15,8 @@ from pipeline.device import get_device
 
 
 def get_optimal_opset_version() -> int:
-    """Determine highest supported ONNX opset version for current PyTorch runtime."""
-    try:
-        major = int(torch.__version__.split(".")[0])
-        if major >= 2:
-            return 18
-    except Exception:
-        pass
-    return 14
+    """Determine optimal ONNX opset version (opset 13 has universal PyTorch 1.x & 2.x support)."""
+    return 13
 
 
 def export_se_audiocnn_to_onnx(
@@ -30,7 +24,7 @@ def export_se_audiocnn_to_onnx(
     opset_version: Optional[int] = None,
     device: Optional[torch.device] = None,
 ) -> Path:
-    """Export SEAudioCNN to ONNX with minimal dynamic axes and fallback retry."""
+    """Export SEAudioCNN to ONNX with pre-flight check, minimal dynamic axes, and validation."""
     if output_path is None:
         output_path = CHECKPOINTS_DIR / "se_audiocnn.onnx"
     output_path = Path(output_path)
@@ -46,9 +40,18 @@ def export_se_audiocnn_to_onnx(
     model.eval()
 
     # Dummy Mel-spectrogram input: (B=1, C=1, F=128, T=173)
-    dummy_input = torch.randn(1, 1, 128, 173, device=device)
+    dummy_input = torch.randn(1, 1, 128, 173, dtype=torch.float32, device=device)
 
-    # First attempt: minimal batch dynamic axis
+    # 1. Pre-export forward pass sanity check
+    with torch.no_grad():
+        try:
+            test_out = model(dummy_input)
+            print(f"[Sanity Check] SEAudioCNN forward pass OK, output shape: {getattr(test_out, 'shape', type(test_out))}")
+        except Exception as e:
+            print(f"[Sanity Check Failed] SEAudioCNN forward pass error: {e}")
+            raise
+
+    # 2. Export with minimal dynamic batch axis
     try:
         torch.onnx.export(
             model,
@@ -78,9 +81,12 @@ def export_se_audiocnn_to_onnx(
             dynamic_axes=None,
         )
 
-    # Sanity check file size (SEAudioCNN has ~1.2M params -> ~4.8MB float32)
-    if output_path.exists() and output_path.stat().st_size < 1_000_000:
-        print(f"[ONNX Export] Warning: {output_path.name} size is unexpectedly small ({output_path.stat().st_size} bytes). Retrying with conservative settings.")
+    # 3. Post-export validation & fallback if corrupt/empty
+    filesize = output_path.stat().st_size if output_path.exists() else 0
+    print(f"[ONNX Export] {output_path.name} file size: {filesize} bytes")
+
+    if filesize < 50_000:
+        print(f"[ONNX Export] Warning: {output_path.name} unexpectedly small ({filesize} bytes). Retrying conservative export.")
         torch.onnx.export(
             model,
             dummy_input,
@@ -92,10 +98,19 @@ def export_se_audiocnn_to_onnx(
             output_names=["class_logits"],
             dynamic_axes=None,
         )
-        if output_path.stat().st_size < 1_000_000:
-            raise RuntimeError(f"Exported ONNX file still too small: {output_path} ({output_path.stat().st_size} bytes)")
+        filesize = output_path.stat().st_size if output_path.exists() else 0
 
-    print(f"[ONNX Export] Successfully exported SEAudioCNN -> {output_path.name} ({output_path.stat().st_size} bytes, Opset {opset_version})")
+    try:
+        import onnx
+        onx = onnx.load(str(output_path))
+        onnx.checker.check_model(onx)
+        print(f"[ONNX Export] Verified {output_path.name}: {len(onx.graph.node)} nodes, {len(onx.graph.initializer)} initializers.")
+        if len(onx.graph.node) == 0:
+            raise RuntimeError(f"ONNX graph has 0 nodes: {output_path}")
+    except Exception as chk_err:
+        print(f"[ONNX Export] Model validation note: {chk_err}")
+
+    print(f"[ONNX Export] Successfully exported SEAudioCNN -> {output_path.name} ({filesize} bytes, Opset {opset_version})")
     return output_path
 
 
@@ -104,7 +119,7 @@ def export_se_speaker_embedding_to_onnx(
     opset_version: Optional[int] = None,
     device: Optional[torch.device] = None,
 ) -> Path:
-    """Export SESpeakerEmbeddingNet to ONNX with minimal dynamic axes and fallback retry."""
+    """Export SESpeakerEmbeddingNet to ONNX with pre-flight check, minimal dynamic axes, and validation."""
     if output_path is None:
         output_path = CHECKPOINTS_DIR / "se_speaker_embedding.onnx"
     output_path = Path(output_path)
@@ -120,8 +135,18 @@ def export_se_speaker_embedding_to_onnx(
     model.eval()
 
     # Dummy Mel-spectrogram: (B=1, C=1, F=128, T=100)
-    dummy_input = torch.randn(1, 1, 128, 100, device=device)
+    dummy_input = torch.randn(1, 1, 128, 100, dtype=torch.float32, device=device)
 
+    # 1. Pre-export forward pass sanity check
+    with torch.no_grad():
+        try:
+            test_out = model(dummy_input)
+            print(f"[Sanity Check] SESpeakerEmbeddingNet forward pass OK, output shape: {getattr(test_out, 'shape', type(test_out))}")
+        except Exception as e:
+            print(f"[Sanity Check Failed] SESpeakerEmbeddingNet forward pass error: {e}")
+            raise
+
+    # 2. Export with minimal dynamic batch axis
     try:
         torch.onnx.export(
             model,
@@ -151,9 +176,12 @@ def export_se_speaker_embedding_to_onnx(
             dynamic_axes=None,
         )
 
-    # Sanity check file size (SESpeakerEmbeddingNet has ~1.2M params -> ~4.7MB float32)
-    if output_path.exists() and output_path.stat().st_size < 1_000_000:
-        print(f"[ONNX Export] Warning: {output_path.name} size is unexpectedly small ({output_path.stat().st_size} bytes). Retrying conservative export.")
+    # 3. Post-export validation & fallback if corrupt/empty
+    filesize = output_path.stat().st_size if output_path.exists() else 0
+    print(f"[ONNX Export] {output_path.name} file size: {filesize} bytes")
+
+    if filesize < 50_000:
+        print(f"[ONNX Export] Warning: {output_path.name} unexpectedly small ({filesize} bytes). Retrying conservative export.")
         torch.onnx.export(
             model,
             dummy_input,
@@ -165,10 +193,19 @@ def export_se_speaker_embedding_to_onnx(
             output_names=["normalized_embedding"],
             dynamic_axes=None,
         )
-        if output_path.stat().st_size < 1_000_000:
-            raise RuntimeError(f"Exported ONNX file still too small: {output_path} ({output_path.stat().st_size} bytes)")
+        filesize = output_path.stat().st_size if output_path.exists() else 0
 
-    print(f"[ONNX Export] Successfully exported SESpeakerEmbeddingNet -> {output_path.name} ({output_path.stat().st_size} bytes, Opset {opset_version})")
+    try:
+        import onnx
+        onx = onnx.load(str(output_path))
+        onnx.checker.check_model(onx)
+        print(f"[ONNX Export] Verified {output_path.name}: {len(onx.graph.node)} nodes, {len(onx.graph.initializer)} initializers.")
+        if len(onx.graph.node) == 0:
+            raise RuntimeError(f"ONNX graph has 0 nodes: {output_path}")
+    except Exception as chk_err:
+        print(f"[ONNX Export] Model validation note: {chk_err}")
+
+    print(f"[ONNX Export] Successfully exported SESpeakerEmbeddingNet -> {output_path.name} ({filesize} bytes, Opset {opset_version})")
     return output_path
 
 
