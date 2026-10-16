@@ -16,21 +16,21 @@ An end-to-end multi-task audio understanding pipeline combining **Speaker Diariz
    - Identifies background acoustic scenes across 10 classes (`air_conditioner`, `car_horn`, `children_playing`, `dog_bark`, `drilling`, `engine_idling`, `gun_shot`, `jackhammer`, `siren`, `street_music`).
    - Deep 4-block 2D-CNN with Global Average Pooling on 128-band Log-Mel Spectrograms.
 
-2. **Real-World Urban Noise Invariance (`UrbanNoiseMixer`)**:
+2. **Real-World Urban Noise Augmentation (`UrbanNoiseMixer`)**:
    - Injects realistic background noise into speech at variable Signal-to-Noise Ratios (SNR from -5 dB to 25 dB).
-   - Guarantees models remain resilient in real-world deployment (street traffic, drilling, sirens).
+   - Enhances acoustic robustness in real-world deployment (street traffic, drilling, sirens) with seamless multi-clip crossfading for long audio streams.
 
 3. **High-Throughput Speaker Identification (VoxCeleb Voiceprints)**:
    - Deep speaker embedding network with Temporal Statistics Pooling producing 128-d L2-normalized voiceprints.
    - Vectorized batch matrix multiplication (`np.dot`) against enrolled voiceprint registries.
 
-4. **Batched Speaker Diarization ("Who Spoke When")**:
-   - Voice Activity Detection (VAD) coupled with batched temporal window embedding extraction.
-   - Sliding-window Agglomerative Clustering on cosine distances (with optional SVD dimensionality reduction for long sessions) to partition multi-speaker dialogue into coherent temporal turns.
+4. **Batched Speaker Diarization with Whole-File STFT Slicing**:
+   - Voice Activity Detection (VAD) coupled with whole-file Mel-spectrogram slicing (eliminating redundant STFT computations across sliding windows).
+   - Enforces strictly non-overlapping chronological speaker turn boundaries ($turn_i.end \le turn_{i+1}.start$) and supports automatic speaker count estimation ($k$ via silhouette scoring).
 
 5. **Speech Emotion Recognition (RAVDESS SER)**:
    - 8-class emotional classification (*neutral, calm, happy, sad, angry, fearful, disgust, surprised*).
-   - Strict speaker-independent evaluation splits (trained on actors 1–20, validated on unseen test actors 21–24).
+   - Strict 3-way speaker-independent disjoint splits: Train (Actors 1–18, 75%), Validation (Actors 19–20, 8.3% for checkpoint selection), and Test (Actors 21–24, 16.7% held-out for unbiased benchmarking).
 
 6. **Interactive Streamlit Web Dashboard**:
    - Live audio playback, dual waveform & Log-Mel spectrogram visualization.
@@ -42,10 +42,13 @@ An end-to-end multi-task audio understanding pipeline combining **Speaker Diariz
 ## ⚡ Performance & Engineering Optimizations
 
 - **Cross-Platform Dynamic Path Resolution**: No hard-coded absolute paths. Paths resolve dynamically relative to project root or can be overridden via `URBANSOUND_BASE_DIR`.
+- **Whole-File STFT & Mel Slicing**: Computes STFT once per continuous waveform and extracts frame slices $O(1)$ for sliding windows, cutting diarization feature extraction latency by up to 10×.
+- **Zero-Disk In-Memory Waveform Analysis**: Multi-task inference accepts in-memory NumPy waveforms directly, eliminating temporary disk I/O and race conditions.
 - **Precomputed Mel Filterbank Reuse**: Mel triangular basis matrices are allocated once per configuration, computing mel power via direct linear algebra `np.dot(mel_basis, |STFT|^2)` rather than rebuilding filterbanks per sample.
 - **Dual-Tier Bounded LRU & Disk Caching**: In-memory spectrogram cache is capped with an LRU policy (`maxsize=2000`) and disk persistence to prevent memory bloat or out-of-memory crashes on large corpora.
-- **Batched Sliding-Window Diarization**: Replaces per-window single forward passes with unified batch tensor processing, accelerating diarization by up to 10×.
-- **Untrained Model Safeguards**: The analyzer flags and surfaces checkpoint provenance (`TRAINED_CHECKPOINT` vs `RANDOMLY_INITIALIZED_UNTRAINED`) and supports `strict_checkpoints=True` to prevent accidental inference on uninitialized weights.
+- **Streaming Batch Inference & Memory Capping**: Window embeddings stream in chunks of `batch_size=32`, avoiding simultaneous allocation of all window spectrograms in RAM.
+- **Strict Timeline Invariants**: Merges contiguous turns of the same speaker and resolves inter-speaker transition boundaries to midpoints, guaranteeing no accidental overlapping turns.
+- **Untrained Model Safeguards**: The analyzer flags and surfaces checkpoint provenance (`TRAINED_CHECKPOINT` vs `RANDOMLY_INITIALIZED_UNTRAINED`) and enforces fail-closed checks by default (`strict_checkpoints=True`).
 
 ---
 

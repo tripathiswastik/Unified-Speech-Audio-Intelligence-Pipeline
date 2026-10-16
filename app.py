@@ -263,19 +263,9 @@ with tab_pipeline:
                 if st.button("🚀 Run Multi-Task Audio Intelligence Pipeline", type="primary", key="pipeline_run_btn"):
                     device_str = "GPU (CUDA)" if torch.cuda.is_available() else "CPU"
                     with st.spinner(f"Executing neural multi-task inference on {device_str}..."):
-                        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as eval_tmp:
-                            sf.write(eval_tmp.name, waveform, SAMPLE_RATE)
-                            eval_tmp_path = Path(eval_tmp.name)
-
-                        try:
-                            spk_arg = None if num_speakers == 0 else int(num_speakers)
-                            report = analyzer.analyze_audio_file(eval_tmp_path, num_speakers=spk_arg)
-                        finally:
-                            if eval_tmp_path.exists():
-                                try:
-                                    os.unlink(eval_tmp_path)
-                                except Exception:
-                                    pass
+                        spk_arg = None if num_speakers == 0 else int(num_speakers)
+                        file_label = selected_file.name if selected_file else "custom_waveform"
+                        report = analyzer.analyze_waveform(waveform, file_name=file_label, num_speakers=spk_arg)
 
                         # Metric Cards
                         m1, m2, m3, m4 = st.columns(4)

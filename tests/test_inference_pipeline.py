@@ -59,3 +59,18 @@ def test_demo_mode_allows_missing_checkpoints(monkeypatch, tmp_path):
     assert analyzer.demo_mode is True
     assert analyzer.urban_checkpoint_loaded is False
 
+
+def test_unified_analyzer_analyze_waveform_in_memory():
+    """Verify analyze_waveform runs directly on in-memory array with zero disk I/O."""
+    analyzer = UnifiedAudioAnalyzer(strict_checkpoints=False, demo_mode=True)
+    # 7 seconds of audio (multi-window with partial tail)
+    t = np.linspace(0, 7.0, int(SAMPLE_RATE * 7.0), endpoint=False)
+    synth_wave = (0.3 * np.sin(2 * np.pi * 400 * t)).astype(np.float32)
+
+    report = analyzer.analyze_waveform(synth_wave, file_name="in_memory_stream.wav", num_speakers=1)
+    assert report["file_name"] == "in_memory_stream.wav"
+    assert report["duration"] == "7.00s"
+    assert "environmental_acoustic_scene" in report
+    assert "speaker_diarization_and_emotions" in report
+
+

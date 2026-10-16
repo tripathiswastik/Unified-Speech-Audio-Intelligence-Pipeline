@@ -65,3 +65,31 @@ def test_auto_speaker_count_diarization():
     segments = diarizer.diarize(wave, num_speakers=None)
     assert isinstance(segments, list)
 
+
+def test_diarization_timeline_monotonic_non_overlapping():
+    """Verify strictly non-overlapping timeline invariant: turn[i].end <= turn[i+1].start."""
+    diarizer = SpeakerDiarizer(window_size_sec=1.5, hop_size_sec=0.5, vad_energy_threshold=0.001)
+    # 8 seconds of alternating synthetic speaker tones
+    t = np.linspace(0, 8.0, int(SAMPLE_RATE * 8.0), endpoint=False)
+    wave = 0.5 * np.sin(2 * np.pi * 300 * t) + 0.1 * np.random.randn(len(t))
+    wave = wave.astype(np.float32)
+
+    segments = diarizer.diarize(wave, num_speakers=2)
+    assert len(segments) >= 1
+    for i in range(len(segments) - 1):
+        assert segments[i].end <= segments[i + 1].start + 1e-5, (
+            f"Overlapping turns detected: Segment {i} ends at {segments[i].end}s "
+            f"but Segment {i+1} starts at {segments[i+1].start}s"
+        )
+
+
+def test_diarization_short_audio_handling():
+    """Verify short audio (0.8s, below 1.5s window) returns a valid segment rather than empty list."""
+    diarizer = SpeakerDiarizer(window_size_sec=1.5, hop_size_sec=0.5, vad_energy_threshold=0.001)
+    short_wave = (0.4 * np.random.randn(int(SAMPLE_RATE * 0.8))).astype(np.float32)
+    segments = diarizer.diarize(short_wave, num_speakers=1)
+    assert len(segments) == 1
+    assert segments[0].start == 0.0
+    assert abs(segments[0].end - 0.8) < 0.05
+
+

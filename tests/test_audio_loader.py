@@ -66,3 +66,22 @@ def test_preprocess_audio_window():
     long_wave = np.ones(int(SAMPLE_RATE * 8.0), dtype=np.float32)
     cropped = preprocess_audio_window(long_wave, target_samples=TARGET_SAMPLES)
     assert len(cropped) == TARGET_SAMPLES
+
+
+def test_urban_noise_mixer_snr_tolerance():
+    """Verify noise mixer produces audio matching target SNR within tolerance."""
+    from pipeline.config import METADATA_CSV
+    from pipeline.urban_noise_mixer import UrbanNoiseMixer
+    if not METADATA_CSV.exists():
+        pytest.skip("UrbanSound8K metadata not present in test environment")
+    try:
+        mixer = UrbanNoiseMixer()
+        t = np.linspace(0, 5.0, int(SAMPLE_RATE * 5.0), endpoint=False)
+        clean = (0.5 * np.sin(2 * np.pi * 440 * t)).astype(np.float32)
+        target_snr = 10.0
+        noisy, noise_cls, achieved_snr = mixer.mix(clean, snr_db=target_snr)
+        assert len(noisy) == len(clean)
+        assert abs(achieved_snr - target_snr) < 2.5
+    except ValueError:
+        pytest.skip("Audio directory folds not populated")
+

@@ -1,5 +1,6 @@
 """UrbanSound8K Noise Mixer.
 Dynamically injects realistic urban environmental noise into speech at configurable SNR levels.
+Supports multi-clip seamless chaining and crossfading for long audio streams.
 """
 from pathlib import Path
 from typing import Optional, List, Tuple
@@ -8,7 +9,7 @@ import numpy as np
 import pandas as pd
 
 from pipeline.config import AUDIO_DIR, METADATA_CSV, SAMPLE_RATE, TARGET_SAMPLES
-from pipeline.audio_loader import load_and_preprocess_audio
+from pipeline.audio_loader import load_full_audio, load_and_preprocess_audio
 
 
 class UrbanNoiseMixer:
@@ -37,20 +38,50 @@ class UrbanNoiseMixer:
         return len(self.noise_records)
 
     def sample_noise(self, target_samples: int = TARGET_SAMPLES) -> Tuple[np.ndarray, str]:
-        """Randomly sample and load an UrbanSound8K noise waveform."""
+        """Randomly sample and load UrbanSound8K noise, seamlessly chaining clips if target is long."""
         rec = random.choice(self.noise_records)
+        target_class = rec["class"]
         noise_path = self.audio_dir / f"fold{rec['fold']}" / rec["slice_file_name"]
-        waveform = load_and_preprocess_audio(noise_path)
 
-        # Ensure matching length
-        if len(waveform) < target_samples:
-            repeats = int(np.ceil(target_samples / len(waveform)))
-            waveform = np.tile(waveform, repeats)[:target_samples]
-        elif len(waveform) > target_samples:
+        # Use load_full_audio to preserve full uncropped noise recording
+        waveform, _ = load_full_audio(noise_path)
+
+        if len(waveform) >= target_samples:
             start = random.randint(0, len(waveform) - target_samples)
-            waveform = waveform[start : start + target_samples]
+            return waveform[start : start + target_samples], target_class
 
-        return waveform, rec["class"]
+        # For audio longer than single noise clip, chain multiple clips from same class with crossfading
+        same_class_records = [r for r in self.noise_records if r["class"] == target_class]
+        if not same_class_records:
+            same_class_records = self.noise_records
+
+        accumulated = [waveform]
+        total_len = len(waveform)
+
+        fade_len = int(0.05 * SAMPLE_RATE)  # 50ms crossfade
+        while total_len < target_samples:
+            next_rec = random.choice(same_class_records)
+            next_path = self.audio_dir / f"fold{next_rec['fold']}" / next_rec["slice_file_name"]
+            next_wave, _ = load_full_audio(next_path)
+            if len(next_wave) < fade_len:
+                next_wave = np.pad(next_wave, (0, fade_len - len(next_wave)), mode="edge")
+
+            # Crossfade previous tail with next head
+            prev = accumulated[-1]
+            if len(prev) >= fade_len:
+                fade_out = np.linspace(1.0, 0.0, fade_len, dtype=np.float32)
+                fade_in = np.linspace(0.0, 1.0, fade_len, dtype=np.float32)
+                blended = prev[-fade_len:] * fade_out + next_wave[:fade_len] * fade_in
+                accumulated[-1] = prev[:-fade_len]
+                accumulated.append(blended)
+                accumulated.append(next_wave[fade_len:])
+            else:
+                accumulated.append(next_wave)
+
+            total_len = sum(len(c) for c in accumulated)
+
+        chained = np.concatenate(accumulated, axis=0)[:target_samples]
+        return chained.astype(np.float32), target_class
 
     def mix(
         self,
@@ -63,37 +94,43 @@ class UrbanNoiseMixer:
         Returns:
             noisy_speech: np.ndarray (float32)
             noise_class: str
-            applied_snr: float
+            applied_snr: float (measured empirical SNR in dB)
         """
         speech_len = len(clean_speech)
         noise_wave, noise_class = self.sample_noise(target_samples=speech_len)
 
         # Determine target SNR
         if snr_db is None:
-            applied_snr = float(random.uniform(snr_range[0], snr_range[1]))
+            target_snr = float(random.uniform(snr_range[0], snr_range[1]))
         else:
-            applied_snr = float(snr_db)
+            target_snr = float(snr_db)
 
         # Calculate RMS powers
-        speech_power = np.mean(clean_speech ** 2)
-        noise_power = np.mean(noise_wave ** 2)
+        speech_power = float(np.mean(clean_speech ** 2))
+        noise_power = float(np.mean(noise_wave ** 2))
 
         if speech_power < 1e-9 or noise_power < 1e-9:
             # Silence in either speech or noise
-            return clean_speech.astype(np.float32), noise_class, applied_snr
+            return clean_speech.astype(np.float32), noise_class, target_snr
 
         # Calculate scale factor for noise to achieve target SNR:
-        # SNR = 10 * log10(P_speech / (scale^2 * P_noise))
         # scale = sqrt(P_speech / (P_noise * 10^(SNR/10)))
-        scale = np.sqrt(speech_power / (noise_power * (10.0 ** (applied_snr / 10.0))))
+        scale = np.sqrt(speech_power / (noise_power * (10.0 ** (target_snr / 10.0))))
         scaled_noise = scale * noise_wave
 
         # Blend
         mixed = clean_speech + scaled_noise
 
         # Peak normalize to avoid clipping while preserving dynamic range
-        peak = np.max(np.abs(mixed))
+        peak = float(np.max(np.abs(mixed)))
         if peak > 1.0:
             mixed = mixed / peak
 
-        return mixed.astype(np.float32), noise_class, applied_snr
+        measured_noise_power = float(np.mean(scaled_noise ** 2))
+        empirical_snr = (
+            float(10.0 * np.log10(speech_power / max(measured_noise_power, 1e-12)))
+            if measured_noise_power > 0
+            else target_snr
+        )
+
+        return mixed.astype(np.float32), noise_class, round(empirical_snr, 2)

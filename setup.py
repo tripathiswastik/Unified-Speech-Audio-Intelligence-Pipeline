@@ -6,7 +6,7 @@ setup(
     description="Unified Speech & Audio Intelligence Pipeline with Environmental Noise Invariance",
     author="Swastik Tripathi",
     packages=find_packages(),
-    python_requires=">=3.7",
+    python_requires=">=3.10",
     install_requires=[
         "numpy>=1.21.0",
         "soundfile>=0.12.0",

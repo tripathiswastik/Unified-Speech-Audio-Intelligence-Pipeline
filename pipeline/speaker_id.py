@@ -8,14 +8,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from pipeline.config import BASE_DIR
+from pipeline.config import BASE_DIR, SAMPLE_RATE
 from pipeline.audio_loader import load_and_preprocess_audio, compute_log_mel_spectrogram
+from pipeline.device import get_device
 
 
 class TemporalStatsPooling(nn.Module):
     """Computes mean and standard deviation across the temporal dimension (x-vector standard)."""
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x shape: (B, C, F, T) -> pool over F and T
         B, C, F, T = x.shape
         x_flat = x.view(B, C * F, T)
         mean = torch.mean(x_flat, dim=-1)
@@ -61,11 +61,8 @@ class SpeakerEmbeddingNet(nn.Module):
         return F.normalize(embedding, p=2, dim=-1)
 
 
-from pipeline.device import get_device
-
-
 class SpeakerIdentifier:
-    """Enrolls voiceprints and identifies speakers based on cosine similarity."""
+    """Enrolls voiceprints and identifies speakers based on vectorized cosine similarity."""
 
     def __init__(self, model: Optional[SpeakerEmbeddingNet] = None, device: Optional[torch.device] = None):
         self.device = device if device is not None else get_device(verbose=False)
@@ -91,26 +88,61 @@ class SpeakerIdentifier:
         self._enrolled_matrix = np.stack([self.enrolled_profiles[name] for name in self._enrolled_names], axis=0)
 
     def extract_embedding(self, waveform: np.ndarray) -> np.ndarray:
-        """Extract a 128-dimensional L2-normalized speaker embedding."""
+        """Extract a 128-dimensional L2-normalized speaker embedding.
+        
+        For long utterances (>4.0s), computes windowed embeddings over 3-second segments
+        and averages them, reducing memory footprint and improving speaker representation.
+        """
+        max_single_samples = int(4.0 * SAMPLE_RATE)
+        if len(waveform) > max_single_samples:
+            window_size = int(3.0 * SAMPLE_RATE)
+            hop_size = int(1.5 * SAMPLE_RATE)
+            window_embs = []
+            with torch.no_grad():
+                for st in range(0, len(waveform) - window_size + 1, hop_size):
+                    chunk = waveform[st : st + window_size]
+                    spec = compute_log_mel_spectrogram(chunk)
+                    spec_tensor = torch.from_numpy(spec).unsqueeze(0).unsqueeze(0).float().to(self.device)
+                    emb = self.model(spec_tensor)[0].cpu().numpy()
+                    window_embs.append(emb)
+            if window_embs:
+                avg_emb = np.mean(window_embs, axis=0)
+                norm = np.linalg.norm(avg_emb)
+                return (avg_emb / max(norm, 1e-12)).astype(np.float32)
+
         spec = compute_log_mel_spectrogram(waveform)
         spec_tensor = torch.from_numpy(spec).unsqueeze(0).unsqueeze(0).float().to(self.device)
         with torch.no_grad():
             emb = self.model(spec_tensor)[0].cpu().numpy()
-        return emb
+        return emb.astype(np.float32)
 
     def extract_batch_embeddings(self, waveforms: List[np.ndarray], batch_size: int = 32) -> np.ndarray:
-        """Extract embeddings for multiple audio windows in batched forward passes."""
+        """Extract embeddings for multiple audio windows using streaming chunked batching."""
         if not waveforms:
             return np.empty((0, 128), dtype=np.float32)
 
-        # Precompute spectrograms
-        specs = [compute_log_mel_spectrogram(w) for w in waveforms]
         all_embeddings = []
+        with torch.no_grad():
+            for i in range(0, len(waveforms), batch_size):
+                chunk_wavs = waveforms[i : i + batch_size]
+                chunk_specs = [compute_log_mel_spectrogram(w) for w in chunk_wavs]
+                batch_tensor = torch.from_numpy(np.stack(chunk_specs, axis=0)).unsqueeze(1).float().to(self.device)
+                chunk_embs = self.model(batch_tensor).cpu().numpy()
+                all_embeddings.append(chunk_embs)
 
+        return np.concatenate(all_embeddings, axis=0)
+
+    def extract_batch_embeddings_from_specs(
+        self, specs: List[np.ndarray], batch_size: int = 32
+    ) -> np.ndarray:
+        """Extract embeddings from pre-sliced spectrograms with streaming GPU batching."""
+        if not specs:
+            return np.empty((0, 128), dtype=np.float32)
+
+        all_embeddings = []
         with torch.no_grad():
             for i in range(0, len(specs), batch_size):
                 chunk = specs[i : i + batch_size]
-                # Stack into (B, 1, n_mels, time_steps)
                 batch_tensor = torch.from_numpy(np.stack(chunk, axis=0)).unsqueeze(1).float().to(self.device)
                 chunk_embs = self.model(batch_tensor).cpu().numpy()
                 all_embeddings.append(chunk_embs)
@@ -143,6 +175,6 @@ class SpeakerIdentifier:
         best_speaker = self._enrolled_names[best_idx]
 
         if best_sim < threshold:
-            return f"Unenrolled ({best_speaker}?)", best_sim
+            return f"Unenrolled ({best_speaker} dist: {best_sim:.2f})", best_sim
 
         return best_speaker, best_sim

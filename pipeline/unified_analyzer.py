@@ -7,6 +7,7 @@ Performs:
 
 Enforces fail-closed checkpoint validation by default, allowing random weights
 only when demo_mode=True is explicitly requested.
+Supports direct zero-disk in-memory waveform analysis.
 """
 from pathlib import Path
 from typing import Dict, Any, List, Optional
@@ -124,24 +125,26 @@ class UnifiedAudioAnalyzer:
         """Register a known speaker's voiceprint from a reference audio file."""
         self.speaker_identifier.enroll(name, audio_path)
 
-    def analyze_audio_file(
-        self, audio_path: Path, num_speakers: Optional[int] = 2
+    def analyze_waveform(
+        self,
+        waveform: np.ndarray,
+        file_name: str = "in_memory_audio",
+        num_speakers: Optional[int] = 2,
     ) -> Dict[str, Any]:
-        """Perform end-to-end multi-task analysis on a continuous audio recording."""
-        audio_path = Path(audio_path)
-        waveform, true_duration = load_full_audio(audio_path)
+        """Perform end-to-end multi-task analysis directly on an in-memory waveform."""
+        true_duration = float(len(waveform)) / float(SAMPLE_RATE) if len(waveform) > 0 else 0.0
 
         if len(waveform) == 0:
             return {
-                "file_name": audio_path.name,
+                "file_name": file_name,
                 "duration": "0.00s",
-                "error": "Empty or unreadable audio file.",
+                "error": "Empty or unreadable audio waveform.",
                 "total_speech_turns": 0,
                 "speaker_diarization_and_emotions": [],
             }
 
         # Step 1: Detect Environmental Acoustic Background across Continuous Audio
-        # For recordings longer than 4.0s, average logits across non-overlapping 4-second windows
+        # Includes all 4.0s chunks plus tail-end coverage
         window_samples = TARGET_SAMPLES
         if len(waveform) <= window_samples:
             env_wave = preprocess_audio_window(waveform, target_samples=window_samples)
@@ -158,6 +161,16 @@ class UnifiedAudioAnalyzer:
                 with torch.no_grad():
                     p = torch.softmax(self.urban_model(spec_tensor), dim=-1)[0].cpu().numpy()
                     window_probs.append(p)
+
+            # Evaluate partial tail window to guarantee full coverage
+            tail_samples = len(waveform) % window_samples
+            if tail_samples >= int(0.25 * SAMPLE_RATE):
+                tail_chunk = waveform[-window_samples:]
+                spec = compute_log_mel_spectrogram(tail_chunk)
+                spec_tensor = torch.from_numpy(spec).unsqueeze(0).unsqueeze(0).float().to(self.device)
+                with torch.no_grad():
+                    window_probs.append(torch.softmax(self.urban_model(spec_tensor), dim=-1)[0].cpu().numpy())
+
             if not window_probs:
                 env_wave = preprocess_audio_window(waveform, target_samples=window_samples)
                 spec = compute_log_mel_spectrogram(env_wave)
@@ -170,7 +183,7 @@ class UnifiedAudioAnalyzer:
         env_scene = ID_TO_CLASS[top_urban_idx]
         env_conf = float(urban_probs[top_urban_idx])
 
-        # Step 2: Full-Recording Speaker Diarization
+        # Step 2: Full-Recording Speaker Diarization with timeline invariants
         segments = self.diarizer.diarize(waveform, num_speakers=num_speakers)
         turns_analysis = []
 
@@ -206,7 +219,7 @@ class UnifiedAudioAnalyzer:
             })
 
         result = {
-            "file_name": audio_path.name,
+            "file_name": file_name,
             "duration": f"{true_duration:.2f}s",
             "model_provenance": {
                 "is_synthetic_demo_mode": self.demo_mode,
@@ -236,6 +249,14 @@ class UnifiedAudioAnalyzer:
             "speaker_diarization_and_emotions": turns_analysis,
         }
         return result
+
+    def analyze_audio_file(
+        self, audio_path: Path, num_speakers: Optional[int] = 2
+    ) -> Dict[str, Any]:
+        """Perform end-to-end multi-task analysis on an audio file on disk."""
+        audio_path = Path(audio_path)
+        waveform, _ = load_full_audio(audio_path)
+        return self.analyze_waveform(waveform, file_name=audio_path.name, num_speakers=num_speakers)
 
 
 if __name__ == "__main__":
