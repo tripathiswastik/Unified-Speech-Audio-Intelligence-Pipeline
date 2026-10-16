@@ -45,6 +45,12 @@ def main():
             print(f"ONNX Runtime Import Error: {ort_err}", file=sys.stderr)
 
         try:
+            import onnxscript
+            print(f"ONNX Script Version: {getattr(onnxscript, '__version__', 'unknown')}", file=sys.stderr)
+        except Exception as os_err:
+            print(f"ONNX Script Import Error: {os_err}", file=sys.stderr)
+
+        try:
             import pkg_resources
             print("\nInstalled Packages:", file=sys.stderr)
             for p in sorted(pkg_resources.working_set, key=lambda p: p.project_name.lower()):
