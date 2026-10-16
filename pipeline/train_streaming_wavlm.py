@@ -129,6 +129,7 @@ class UrbanSoundRawDataset(Dataset):
         if not self.metadata_csv.exists():
             raise FileNotFoundError(f"UrbanSound8K metadata not found: {self.metadata_csv}")
         df = pd.read_csv(self.metadata_csv)
+        assert isinstance(df, pd.DataFrame)
         self.df = df[df["fold"].isin(folds)].reset_index(drop=True)
 
         if strict:
@@ -153,8 +154,8 @@ class UrbanSoundRawDataset(Dataset):
     def __len__(self) -> int:
         return len(self.df)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
-        row = self.df.iloc[idx]
+    def __getitem__(self, index: int) -> Tuple[torch.Tensor, int]:
+        row = self.df.iloc[index]
         fp = self.audio_dir / f"fold{row['fold']}" / row["slice_file_name"]
         wav = load_raw_pcm16(fp)
         label = int(row["classID"])
@@ -220,10 +221,10 @@ class VoxCelebRawDataset(Dataset):
     def __len__(self) -> int:
         return len(self.items)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
+    def __getitem__(self, index: int) -> Tuple[torch.Tensor, int]:
         if not self.items:
             raise IndexError("VoxCeleb dataset is empty.")
-        fp, spk_id = self.items[idx]
+        fp, spk_id = self.items[index]
         wav = load_raw_pcm16(fp)
         return torch.from_numpy(wav), spk_id
 
@@ -250,6 +251,7 @@ class RAVDESSRawDataset(Dataset):
             return
 
         df = pd.read_csv(self.metadata_csv)
+        assert isinstance(df, pd.DataFrame)
         self.df = df[df["actor_id"].isin(actors)].reset_index(drop=True)
 
         if strict:
@@ -267,10 +269,10 @@ class RAVDESSRawDataset(Dataset):
     def __len__(self) -> int:
         return len(self.df)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
+    def __getitem__(self, index: int) -> Tuple[torch.Tensor, int]:
         if len(self.df) == 0:
             raise IndexError("RAVDESS dataset is empty.")
-        row = self.df.iloc[idx]
+        row = self.df.iloc[index]
         fp = self.speech_root / row["relative_path"]
         wav = load_raw_pcm16(fp)
         label = int(row["emotion_id"])
@@ -399,7 +401,7 @@ class MultiTaskUncertaintyLoss(nn.Module):
 
 
 def process_audio_in_streaming_chunks(
-    model: MultiTaskStreamingWavLM,
+    model: nn.Module,
     waveforms: torch.Tensor,
     chunk_samples: int = CHUNK_SAMPLES,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
