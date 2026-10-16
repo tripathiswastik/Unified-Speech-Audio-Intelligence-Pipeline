@@ -77,8 +77,8 @@ class EmotionDataset(Dataset):
 
 @overload
 def get_emotion_dataloaders(
-    train_actors: List[int] = ...,
-    val_actors: List[int] = ...,
+    train_actors: Optional[List[int]] = None,
+    val_actors: Optional[List[int]] = None,
     test_actors: None = None,
     batch_size: int = 32,
     use_noise_augmentation: bool = True,
@@ -87,8 +87,8 @@ def get_emotion_dataloaders(
 
 @overload
 def get_emotion_dataloaders(
-    train_actors: List[int],
-    val_actors: List[int],
+    train_actors: Optional[List[int]],
+    val_actors: Optional[List[int]],
     test_actors: List[int],
     batch_size: int = 32,
     use_noise_augmentation: bool = True,
