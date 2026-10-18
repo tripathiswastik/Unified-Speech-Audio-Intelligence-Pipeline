@@ -162,6 +162,9 @@ class UrbanSoundRawDataset(Dataset):
                 )
             self.df = pd.DataFrame(valid_rows).reset_index(drop=True)
 
+        self.file_paths = [self.audio_dir / f"fold{row['fold']}" / row["slice_file_name"] for _, row in self.df.iterrows()]
+        self.labels = [int(row["classID"]) for _, row in self.df.iterrows()]
+
     def __len__(self) -> int:
         return len(self.df)
 
@@ -176,10 +179,11 @@ class UrbanSoundRawDataset(Dataset):
 class VoxCelebRawDataset(Dataset):
     """Raw waveform dataset for VoxCeleb speaker identification and open-set verification.
     
-    Supports:
-      - split="train": 80% files per training speaker (with random crop)
-      - split="heldout_id": 20% held-out files of training speakers (with deterministic center crop and shared speaker_to_id)
-      - split="val": Disjoint unseen speakers for open-set verification trials (deterministic center crop)
+    Supports 4 distinct splits:
+      - split="train": Disjoint training speakers, 80% files per speaker (with random crop)
+      - split="heldout_id": Same training speakers, remaining 20% files per speaker (deterministic center crop, shared speaker_to_id)
+      - split="val": Disjoint unseen speakers for open-set validation verification (deterministic center crop)
+      - split="test": Disjoint unseen speakers for independent test verification (deterministic center crop)
     """
 
     def __init__(
@@ -200,6 +204,9 @@ class VoxCelebRawDataset(Dataset):
         self.items: List[Tuple[Path, int]] = []
         self.speaker_to_id: Dict[str, int] = {}
         self.speaker_files: Dict[int, List[Path]] = {}
+        self.speaker_names: List[str] = []
+        self.file_paths: List[Path] = []
+        self.labels: List[int] = []
 
         if not self.vox_root.exists():
             if strict:
@@ -216,17 +223,44 @@ class VoxCelebRawDataset(Dataset):
             return
 
         if speaker_disjoint:
-            # 80% speakers for train & heldout_id; 20% disjoint speakers for open-set verification
-            split_idx = max(1, int(0.8 * len(spk_dirs)))
-            train_spk_dirs = spk_dirs[:split_idx]
-            val_spk_dirs = spk_dirs[split_idx:] if split_idx < len(spk_dirs) else spk_dirs[-1:]
+            # 3-way disjoint speaker partition: train (and heldout_id), disjoint validation, disjoint test
+            n_spk = len(spk_dirs)
+            if n_spk >= 6:
+                n_val = max(2, int(0.15 * n_spk))
+                n_test = max(2, int(0.15 * n_spk))
+                n_train = n_spk - n_val - n_test
+                if n_train < 2:
+                    n_train = max(2, n_spk - 4)
+                    rem = n_spk - n_train
+                    n_val = max(1, rem // 2)
+                    n_test = rem - n_val
+            elif n_spk >= 3:
+                n_val = 1
+                n_test = 1
+                n_train = n_spk - 2
+            else:
+                n_train = max(1, n_spk - 1)
+                n_val = 1 if n_spk > 1 else 1
+                n_test = 1
+
+            train_spk_dirs = spk_dirs[:n_train]
+            val_spk_dirs = spk_dirs[n_train:n_train + n_val]
+            test_spk_dirs = spk_dirs[n_train + n_val:] if (n_train + n_val) < n_spk else spk_dirs[-1:]
 
             if split in ("train", "heldout_id"):
                 active_dirs = train_spk_dirs
-            else:
+            elif split == "val":
                 active_dirs = val_spk_dirs
+            elif split == "test":
+                active_dirs = test_spk_dirs
+            else:
+                raise ValueError(
+                    f"Unknown VoxCeleb split '{split}'. Expected 'train', 'heldout_id', 'val', or 'test'."
+                )
         else:
             active_dirs = spk_dirs
+
+        self.speaker_names = [d.name for d in active_dirs]
 
         if speaker_to_id is not None:
             self.speaker_to_id = speaker_to_id
@@ -242,17 +276,22 @@ class VoxCelebRawDataset(Dataset):
                 continue
 
             if split in ("train", "heldout_id") and speaker_disjoint:
-                # Deterministic 80/20 per-speaker file partition
-                n_tr = max(1, int(0.8 * len(all_files)))
-                selected_files = all_files[:n_tr] if split == "train" else all_files[n_tr:]
-                if not selected_files:
-                    selected_files = all_files[-1:]
+                # Deterministic 80/20 per-speaker file partition without overlap
+                if len(all_files) >= 2:
+                    n_tr = max(1, int(0.8 * len(all_files)))
+                    if n_tr >= len(all_files):
+                        n_tr = len(all_files) - 1
+                    selected_files = all_files[:n_tr] if split == "train" else all_files[n_tr:]
+                else:
+                    selected_files = all_files if split == "train" else []
             else:
                 selected_files = all_files
 
             self.speaker_files[spk_id] = selected_files
             for f in selected_files:
                 self.items.append((f, spk_id))
+                self.file_paths.append(f)
+                self.labels.append(spk_id)
 
         if strict and not self.items:
             raise FileNotFoundError(f"No WAV audio files found for VoxCeleb split={split} in {self.vox_root}")
@@ -282,6 +321,10 @@ class RAVDESSRawDataset(Dataset):
         self.speech_root = Path(speech_root)
         self.metadata_csv = Path(metadata_csv)
         self.is_train = is_train
+        self.file_paths: List[Path] = []
+        self.labels: List[int] = []
+        self.actors: List[int] = []
+
         if not self.metadata_csv.exists():
             if strict:
                 raise FileNotFoundError(f"RAVDESS metadata CSV not found: {self.metadata_csv}")
@@ -304,6 +347,10 @@ class RAVDESSRawDataset(Dataset):
                 raise FileNotFoundError(f"No RAVDESS audio files found in {self.speech_root} for actors {actors}")
             self.df = pd.DataFrame(valid_rows).reset_index(drop=True)
 
+        self.file_paths = [self.speech_root / row["relative_path"] for _, row in self.df.iterrows()] if len(self.df) > 0 else []
+        self.labels = [int(row["emotion_id"]) for _, row in self.df.iterrows()] if len(self.df) > 0 else []
+        self.actors = list(self.df["actor_id"].unique()) if len(self.df) > 0 else []
+
     def __len__(self) -> int:
         return len(self.df)
 
@@ -319,27 +366,89 @@ class RAVDESSRawDataset(Dataset):
 
 def run_dataset_preflight_audit(
     splits: Union[Dict[str, Any], Sequence[Tuple[str, Any]]],
-    max_verify_per_split: int = 5,
+    val_spk_trials: Optional[List[Tuple[Path, Path, int]]] = None,
+    test_spk_trials: Optional[List[Tuple[Path, Path, int]]] = None,
+    max_verify_per_split: int = 50,
     min_samples: int = 1,
 ) -> Dict[str, Any]:
-    """Execute preflight audit across all dataset splits.
+    """Execute rigorous preflight integrity audit across all dataset splits.
     
     Verifies:
       1. Minimum required samples (min_samples).
-      2. Valid decoding and finite samples (no NaNs or Infs).
-      3. Non-zero energy / non-silent waveforms.
-      4. Valid label types and values.
+      2. File existence and valid audio file size (> 44 bytes).
+      3. Label range validity across 100% of samples (UrbanSound 0-9, RAVDESS 0-7, VoxCeleb 0..N-1).
+      4. Full class coverage (all scene classes, emotion classes, and training speaker identities).
+      5. Decoded audio integrity (finite samples, non-zero energy, correct sample duration).
+      6. Cross-split zero-leakage disjointness:
+         - UrbanSound train vs val disjointness
+         - RAVDESS train (actors 1-18) vs val (19-20) vs test (21-24) actor and file disjointness
+         - VoxCeleb train vs heldout_id vs val vs test speaker and file disjointness
+         - Speaker verification val trials vs test trials disjointness (no shared files, no shared speakers)
     """
     print("\n" + "=" * 80)
-    print(" PREFLIGHT DATASET INTEGRITY AUDIT")
+    print(" PREFLIGHT DATASET INTEGRITY & DISJOINTNESS AUDIT")
     print("=" * 80)
     audit_results: Dict[str, Any] = {}
     items: Sequence[Tuple[str, Any]] = list(splits.items()) if isinstance(splits, dict) else list(splits)
+    splits_dict: Dict[str, Any] = dict(items)
+
     for name, ds in items:
         count: int = len(ds) if hasattr(ds, "__len__") else 0
         if count < min_samples:
             raise ValueError(f"[Preflight Audit Failed] Dataset split '{name}' has {count} samples, fewer than required min_samples={min_samples}.")
 
+        labels: List[int] = getattr(ds, "labels", None)
+        file_paths: List[Path] = getattr(ds, "file_paths", None)
+        if labels is None and hasattr(ds, "items") and ds.items:
+            labels = [lbl for _, lbl in ds.items]
+            file_paths = [fp for fp, _ in ds.items]
+
+        # 1. 100% Label Type and Range Verification
+        if labels is not None and len(labels) > 0:
+            for idx, label in enumerate(labels):
+                if not isinstance(label, (int, np.integer)):
+                    raise TypeError(f"[Preflight Audit Failed] Invalid label type {type(label)} at index {idx} in split '{name}'.")
+                if label < 0:
+                    raise ValueError(f"[Preflight Audit Failed] Negative label {label} at index {idx} in split '{name}'.")
+                if "UrbanSound" in name and label >= len(CLASSES):
+                    raise ValueError(f"[Preflight Audit Failed] Label {label} exceeds max classes ({len(CLASSES)}) in split '{name}'.")
+                if "RAVDESS" in name and label >= len(EMOTIONS):
+                    raise ValueError(f"[Preflight Audit Failed] Emotion label {label} exceeds max classes ({len(EMOTIONS)}) in split '{name}'.")
+                if ("VoxCeleb (Train)" in name or "Heldout ID" in name) and hasattr(ds, "speaker_to_id"):
+                    num_spk = len(ds.speaker_to_id)
+                    if label >= num_spk:
+                        raise ValueError(f"[Preflight Audit Failed] Speaker label {label} >= num_speakers ({num_spk}) in split '{name}'.")
+
+            # 2. Class Coverage Verification
+            unique_labels = set(labels)
+            if "UrbanSound (Train)" in name:
+                expected_classes = set(range(len(CLASSES)))
+                if unique_labels != expected_classes:
+                    raise ValueError(f"[Preflight Audit Failed] Inadequate class coverage in '{name}'. Missing: {expected_classes - unique_labels}")
+            elif "RAVDESS (Train" in name:
+                expected_emotions = set(range(len(EMOTIONS)))
+                if unique_labels != expected_emotions:
+                    raise ValueError(f"[Preflight Audit Failed] Inadequate emotion coverage in '{name}'. Missing: {expected_emotions - unique_labels}")
+            elif "VoxCeleb (Train)" in name and hasattr(ds, "speaker_to_id"):
+                expected_spks = set(range(len(ds.speaker_to_id)))
+                if unique_labels != expected_spks:
+                    raise ValueError(f"[Preflight Audit Failed] Inadequate speaker coverage in '{name}'. Missing: {expected_spks - unique_labels}")
+
+        if "VoxCeleb (Disjoint Val)" in name or "VoxCeleb (Disjoint Test)" in name:
+            num_spk_groups = len(getattr(ds, "speaker_files", {}))
+            if num_spk_groups < 2:
+                raise ValueError(f"[Preflight Audit Failed] '{name}' has only {num_spk_groups} speaker(s), requires at least 2 disjoint speakers for open-set verification.")
+
+        # 3. 100% File Existence and Header Size Verification
+        if file_paths is not None and len(file_paths) > 0:
+            for fp in file_paths:
+                if not fp.exists():
+                    raise FileNotFoundError(f"[Preflight Audit Failed] Audio file does not exist in split '{name}': {fp}")
+                st_size = fp.stat().st_size
+                if st_size <= 44:
+                    raise ValueError(f"[Preflight Audit Failed] Corrupt/truncated audio file (size {st_size} bytes <= 44) in split '{name}': {fp}")
+
+        # 4. Decoded Waveform Numerical Integrity Verification
         num_to_check = min(count, max_verify_per_split)
         indices_to_test = np.linspace(0, count - 1, num_to_check, dtype=int) if count > 0 else []
         for idx in indices_to_test:
@@ -349,14 +458,100 @@ def run_dataset_preflight_audit(
                 raise ValueError(f"[Preflight Audit Failed] Non-finite values in split '{name}' at index {idx}.")
             if float(np.max(np.abs(wav_np))) < 1e-4:
                 raise ValueError(f"[Preflight Audit Failed] Silent / zero-amplitude audio in split '{name}' at index {idx}.")
-            if not isinstance(label, (int, np.integer)):
-                raise TypeError(f"[Preflight Audit Failed] Invalid label type {type(label)} in split '{name}'.")
+            if len(wav_np) != TOTAL_WINDOW_SAMPLES:
+                raise ValueError(f"[Preflight Audit Failed] Invalid waveform length {len(wav_np)} in '{name}'. Expected {TOTAL_WINDOW_SAMPLES}.")
 
         audit_results[name] = {"count": count, "status": "VERIFIED"}
-        print(f"  * {name:<25}: {count:>5} samples verified (audited {num_to_check} decoded WAVs)")
+        print(f"  * {name:<30}: {count:>5} samples verified (audited {len(file_paths or [])} files, {num_to_check} decoded WAVs)")
+
+    # 5. Cross-Split Zero-Leakage Disjointness Verification
+    print("  * Checking cross-split zero-leakage invariants...")
+    
+    # UrbanSound
+    if "UrbanSound (Train)" in splits_dict and "UrbanSound (Val)" in splits_dict:
+        u_tr_f = set(getattr(splits_dict["UrbanSound (Train)"], "file_paths", []))
+        u_va_f = set(getattr(splits_dict["UrbanSound (Val)"], "file_paths", []))
+        if u_tr_f and u_va_f and not u_tr_f.isdisjoint(u_va_f):
+            raise ValueError(f"[Preflight Audit Failed] Data leakage: UrbanSound train and val share {len(u_tr_f & u_va_f)} files!")
+
+    # RAVDESS
+    r_tr = splits_dict.get("RAVDESS (Train Actors 1-18)")
+    r_va = splits_dict.get("RAVDESS (Val Actors 19-20)")
+    r_te = splits_dict.get("RAVDESS (Test Actors 21-24)")
+    if r_tr and r_va and r_te:
+        tr_act = set(getattr(r_tr, "actors", []))
+        va_act = set(getattr(r_va, "actors", []))
+        te_act = set(getattr(r_te, "actors", []))
+        if not tr_act.isdisjoint(va_act):
+            raise ValueError(f"[Preflight Audit Failed] RAVDESS train and val share actors: {tr_act & va_act}")
+        if not va_act.isdisjoint(te_act):
+            raise ValueError(f"[Preflight Audit Failed] RAVDESS val and test share actors: {va_act & te_act}")
+        if not tr_act.isdisjoint(te_act):
+            raise ValueError(f"[Preflight Audit Failed] RAVDESS train and test share actors: {tr_act & te_act}")
+
+        tr_rf = set(getattr(r_tr, "file_paths", []))
+        va_rf = set(getattr(r_va, "file_paths", []))
+        te_rf = set(getattr(r_te, "file_paths", []))
+        if tr_rf and va_rf and not tr_rf.isdisjoint(va_rf):
+            raise ValueError("[Preflight Audit Failed] RAVDESS train and val share audio files!")
+        if va_rf and te_rf and not va_rf.isdisjoint(te_rf):
+            raise ValueError("[Preflight Audit Failed] RAVDESS val and test share audio files!")
+        if tr_rf and te_rf and not tr_rf.isdisjoint(te_rf):
+            raise ValueError("[Preflight Audit Failed] RAVDESS train and test share audio files!")
+
+    # VoxCeleb
+    v_tr = splits_dict.get("VoxCeleb (Train)")
+    v_hid = splits_dict.get("VoxCeleb (Heldout ID)")
+    v_va = splits_dict.get("VoxCeleb (Disjoint Val)")
+    v_te = splits_dict.get("VoxCeleb (Disjoint Test)")
+    if v_tr and v_va and v_te:
+        tr_spks = set(getattr(v_tr, "speaker_names", []))
+        va_spks = set(getattr(v_va, "speaker_names", []))
+        te_spks = set(getattr(v_te, "speaker_names", []))
+        if not tr_spks.isdisjoint(va_spks):
+            raise ValueError(f"[Preflight Audit Failed] VoxCeleb train and val share speakers: {tr_spks & va_spks}")
+        if not va_spks.isdisjoint(te_spks):
+            raise ValueError(f"[Preflight Audit Failed] VoxCeleb val and test share speakers: {va_spks & te_spks}")
+        if not tr_spks.isdisjoint(te_spks):
+            raise ValueError(f"[Preflight Audit Failed] VoxCeleb train and test share speakers: {tr_spks & te_spks}")
+
+        tr_vf = set(getattr(v_tr, "file_paths", []))
+        hid_vf = set(getattr(v_hid, "file_paths", [])) if v_hid else set()
+        va_vf = set(getattr(v_va, "file_paths", []))
+        te_vf = set(getattr(v_te, "file_paths", []))
+        if tr_vf and hid_vf and not tr_vf.isdisjoint(hid_vf):
+            raise ValueError(f"[Preflight Audit Failed] VoxCeleb train and heldout_id share {len(tr_vf & hid_vf)} audio files!")
+        if tr_vf and va_vf and not tr_vf.isdisjoint(va_vf):
+            raise ValueError("[Preflight Audit Failed] VoxCeleb train and val share audio files!")
+        if tr_vf and te_vf and not tr_vf.isdisjoint(te_vf):
+            raise ValueError("[Preflight Audit Failed] VoxCeleb train and test share audio files!")
+        if va_vf and te_vf and not va_vf.isdisjoint(te_vf):
+            raise ValueError("[Preflight Audit Failed] VoxCeleb val and test share audio files!")
+
+    # 6. Speaker Verification Trials Disjointness
+    if val_spk_trials is not None and test_spk_trials is not None:
+        val_trial_files = {f1 for f1, f2, _ in val_spk_trials} | {f2 for f1, f2, _ in val_spk_trials}
+        test_trial_files = {f1 for f1, f2, _ in test_spk_trials} | {f2 for f1, f2, _ in test_spk_trials}
+        trial_f_overlap = val_trial_files & test_trial_files
+        if trial_f_overlap:
+            raise ValueError(f"[Preflight Audit Failed] Speaker verification val and test trials share {len(trial_f_overlap)} files: {list(trial_f_overlap)[:3]}")
+
+        val_trial_spks = {f.parent.parent.name for f in val_trial_files}
+        test_trial_spks = {f.parent.parent.name for f in test_trial_files}
+        spk_overlap = val_trial_spks & test_trial_spks
+        if spk_overlap:
+            raise ValueError(f"[Preflight Audit Failed] Speaker verification val and test trials share speakers: {spk_overlap}")
+
+        if v_tr:
+            tr_vf = set(getattr(v_tr, "file_paths", []))
+            tr_spks = set(getattr(v_tr, "speaker_names", []))
+            if test_trial_files & tr_vf:
+                raise ValueError("[Preflight Audit Failed] Independent test speaker trials contain training audio files!")
+            if test_trial_spks & tr_spks:
+                raise ValueError(f"[Preflight Audit Failed] Independent test speaker trials contain training speakers: {test_trial_spks & tr_spks}")
 
     print("=" * 80)
-    print(" [Preflight Audit Passed] All dataset splits structurally verified & compliant.\n")
+    print(" [Preflight Audit Passed] All dataset splits and trials structurally verified & disjoint.\n")
     return audit_results
 
 
@@ -856,9 +1051,9 @@ def main():
     if args.smoke_test:
         args.epochs = 2
         args.batch_size = 4
-        args.max_speakers = 6
+        args.max_speakers = 8
         args.max_steps_per_epoch = 10
-        print("[Smoke Test Mode] Enabled: epochs=2, batch_size=4, max_speakers=6, max_steps=10")
+        print("[Smoke Test Mode] Enabled: epochs=2, batch_size=4, max_speakers=8, max_steps=10")
 
     device = get_device()
     print(f"[Causal MultiTask Transformer] Initializing Joint Training on Device: {device}...")
@@ -872,9 +1067,17 @@ def main():
     # - Train: 80% files of training speakers
     # - Heldout ID: remaining 20% files of SAME training speakers (for valid top-1 metric)
     # - Val: disjoint unseen speakers for open-set verification
+    # - Test: completely disjoint unseen speakers for independent held-out verification
     ds_vox_train = VoxCelebRawDataset(max_speakers=args.max_speakers, split="train", is_train=True, strict=False)
-    ds_vox_heldout_id = VoxCelebRawDataset(max_speakers=args.max_speakers, split="heldout_id", is_train=False, strict=False)
+    ds_vox_heldout_id = VoxCelebRawDataset(
+        max_speakers=args.max_speakers,
+        split="heldout_id",
+        speaker_to_id=ds_vox_train.speaker_to_id,
+        is_train=False,
+        strict=False,
+    )
     ds_vox_val = VoxCelebRawDataset(max_speakers=args.max_speakers, split="val", is_train=False, strict=False)
+    ds_vox_test = VoxCelebRawDataset(max_speakers=args.max_speakers, split="test", is_train=False, strict=False)
     num_speakers = max(2, len(ds_vox_train.speaker_to_id))
 
     # DataLoaders: RAVDESS
@@ -885,7 +1088,11 @@ def main():
     ds_ravdess_val = RAVDESSRawDataset(actors=[19, 20], is_train=False, strict=False)
     ds_ravdess_test = RAVDESSRawDataset(actors=list(range(21, 25)), is_train=False, strict=False)
 
-    # Preflight Dataset Integrity Audit
+    # Generate fixed reproducible speaker verification trials once from disjoint splits
+    val_spk_trials = generate_speaker_verification_trials(ds_vox_val, num_pairs=args.num_spk_trials, seed=42)
+    test_spk_trials = generate_speaker_verification_trials(ds_vox_test, num_pairs=max(args.num_spk_trials * 2, 200), seed=1337)
+
+    # Preflight Dataset Integrity & Disjointness Audit
     if args.audit_datasets:
         print("[Preflight Audit] Initiating integrity check across all dataset splits...")
         splits_to_audit = [
@@ -894,16 +1101,19 @@ def main():
             ("VoxCeleb (Train)", ds_vox_train),
             ("VoxCeleb (Heldout ID)", ds_vox_heldout_id),
             ("VoxCeleb (Disjoint Val)", ds_vox_val),
+            ("VoxCeleb (Disjoint Test)", ds_vox_test),
             ("RAVDESS (Train Actors 1-18)", ds_ravdess_train),
             ("RAVDESS (Val Actors 19-20)", ds_ravdess_val),
             ("RAVDESS (Test Actors 21-24)", ds_ravdess_test),
         ]
         min_req = 1 if args.smoke_test else min(args.batch_size, 4)
-        run_dataset_preflight_audit(splits_to_audit, max_verify_per_split=20 if args.smoke_test else 50, min_samples=min_req)
-
-    # Generate fixed reproducible speaker verification trials once
-    val_spk_trials = generate_speaker_verification_trials(ds_vox_val, num_pairs=args.num_spk_trials, seed=42)
-    test_spk_trials = generate_speaker_verification_trials(ds_vox_val, num_pairs=max(args.num_spk_trials * 2, 200), seed=1337)
+        run_dataset_preflight_audit(
+            splits=splits_to_audit,
+            val_spk_trials=val_spk_trials,
+            test_spk_trials=test_spk_trials,
+            max_verify_per_split=20 if args.smoke_test else 50,
+            min_samples=min_req,
+        )
 
     loader_urban_train = DataLoader(ds_urban_train, batch_size=args.batch_size, shuffle=True, drop_last=True)
     loader_urban_val = DataLoader(ds_urban_val, batch_size=args.batch_size, shuffle=False)
@@ -919,8 +1129,8 @@ def main():
     print(
         f"[Causal MultiTask Transformer] Datasets & Trials verified:\n"
         f"  - UrbanSound:  {len(ds_urban_train)} train, {len(ds_urban_val)} val (Fold {args.val_fold})\n"
-        f"  - VoxCeleb:    {len(ds_vox_train)} train, {len(ds_vox_heldout_id)} heldout-id, {len(ds_vox_val)} disjoint-val ({num_speakers} train classes)\n"
-        f"  - Spk Trials:  {len(val_spk_trials)} fixed validation pairs, {len(test_spk_trials)} test pairs\n"
+        f"  - VoxCeleb:    {len(ds_vox_train)} train, {len(ds_vox_heldout_id)} heldout-id, {len(ds_vox_val)} disjoint-val, {len(ds_vox_test)} disjoint-test ({num_speakers} train classes)\n"
+        f"  - Spk Trials:  {len(val_spk_trials)} fixed validation pairs, {len(test_spk_trials)} independent test pairs\n"
         f"  - RAVDESS:     {len(ds_ravdess_train)} train (1-18), {len(ds_ravdess_val)} val (19-20), {len(ds_ravdess_test)} test (21-24)\n"
     )
 

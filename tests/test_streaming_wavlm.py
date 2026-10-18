@@ -479,5 +479,123 @@ class TestStreamingParityAndEndToEndValidation:
             assert loaded["epoch"] == 5
             assert loaded["best_composite"] == 0.88
 
+    def test_voxceleb_splits_disjoint_identities_and_files(self):
+        """Verify VoxCeleb train, heldout_id, val, and test splits have completely disjoint identities and files."""
+        from pipeline.train_streaming_wavlm import VoxCelebRawDataset
+
+        ds_train = VoxCelebRawDataset(max_speakers=8, split="train", strict=False)
+        ds_heldout = VoxCelebRawDataset(max_speakers=8, split="heldout_id", speaker_to_id=ds_train.speaker_to_id, strict=False)
+        ds_val = VoxCelebRawDataset(max_speakers=8, split="val", strict=False)
+        ds_test = VoxCelebRawDataset(max_speakers=8, split="test", strict=False)
+
+        assert len(ds_train) > 0 and len(ds_heldout) > 0 and len(ds_val) > 0 and len(ds_test) > 0
+
+        tr_spk = set(ds_train.speaker_names)
+        va_spk = set(ds_val.speaker_names)
+        te_spk = set(ds_test.speaker_names)
+
+        # 1. Speaker identity disjointness
+        assert tr_spk.isdisjoint(va_spk), f"Train and val share speakers: {tr_spk & va_spk}"
+        assert va_spk.isdisjoint(te_spk), f"Val and test share speakers: {va_spk & te_spk}"
+        assert tr_spk.isdisjoint(te_spk), f"Train and test share speakers: {tr_spk & te_spk}"
+
+        # 2. Audio file path disjointness
+        tr_f = set(ds_train.file_paths)
+        hid_f = set(ds_heldout.file_paths)
+        va_f = set(ds_val.file_paths)
+        te_f = set(ds_test.file_paths)
+
+        assert tr_f.isdisjoint(hid_f), f"Train and heldout_id share files: {tr_f & hid_f}"
+        assert tr_f.isdisjoint(va_f), f"Train and val share files: {tr_f & va_f}"
+        assert tr_f.isdisjoint(te_f), f"Train and test share files: {tr_f & te_f}"
+        assert va_f.isdisjoint(te_f), f"Val and test share files: {va_f & te_f}"
+
+    def test_speaker_verification_trials_zero_leakage_and_independent_populations(self):
+        """Verify that validation and test speaker verification trials do not overlap in files or speaker identities."""
+        from pipeline.train_streaming_wavlm import VoxCelebRawDataset, generate_speaker_verification_trials
+
+        ds_train = VoxCelebRawDataset(max_speakers=8, split="train", strict=False)
+        ds_val = VoxCelebRawDataset(max_speakers=8, split="val", strict=False)
+        ds_test = VoxCelebRawDataset(max_speakers=8, split="test", strict=False)
+
+        val_trials = generate_speaker_verification_trials(ds_val, num_pairs=10, seed=42)
+        test_trials = generate_speaker_verification_trials(ds_test, num_pairs=10, seed=1337)
+
+        assert len(val_trials) > 0
+        assert len(test_trials) > 0
+
+        val_files = {f1 for f1, f2, _ in val_trials} | {f2 for f1, f2, _ in val_trials}
+        test_files = {f1 for f1, f2, _ in test_trials} | {f2 for f1, f2, _ in test_trials}
+        tr_files = set(ds_train.file_paths)
+
+        # Trials file path disjointness
+        assert val_files.isdisjoint(test_files), f"Val and test trials share files: {val_files & test_files}"
+        assert test_files.isdisjoint(tr_files), f"Test trials contain training files: {test_files & tr_files}"
+
+        # Trials speaker identity disjointness
+        val_speakers = {f.parent.parent.name for f in val_files}
+        test_speakers = {f.parent.parent.name for f in test_files}
+        tr_speakers = set(ds_train.speaker_names)
+
+        assert val_speakers.isdisjoint(test_speakers), f"Val and test trials share speakers: {val_speakers & test_speakers}"
+        assert test_speakers.isdisjoint(tr_speakers), f"Test trials contain training speakers: {test_speakers & tr_speakers}"
+
+    def test_preflight_audit_enforces_cross_split_disjointness_and_rejects_leakage(self):
+        """Verify that run_dataset_preflight_audit raises ValueError if trials or speakers overlap across splits."""
+        from pipeline.train_streaming_wavlm import VoxCelebRawDataset, generate_speaker_verification_trials, run_dataset_preflight_audit
+
+        ds_val = VoxCelebRawDataset(max_speakers=8, split="val", strict=False)
+        ds_test = VoxCelebRawDataset(max_speakers=8, split="test", strict=False)
+
+        val_trials = generate_speaker_verification_trials(ds_val, num_pairs=4, seed=42)
+        # Artificially contaminate test trials with a validation trial
+        contaminated_test_trials = list(val_trials[:1]) + generate_speaker_verification_trials(ds_test, num_pairs=4, seed=1337)
+
+        splits = [
+            ("VoxCeleb (Disjoint Val)", ds_val),
+            ("VoxCeleb (Disjoint Test)", ds_test),
+        ]
+
+        with pytest.raises(ValueError) as excinfo:
+            run_dataset_preflight_audit(splits, val_spk_trials=val_trials, test_spk_trials=contaminated_test_trials, min_samples=1)
+        assert "share" in str(excinfo.value).lower() or "preflight audit failed" in str(excinfo.value).lower()
+
+    def test_preflight_audit_detects_corrupt_audio_and_inadequate_coverage(self):
+        """Verify preflight audit detects truncated files, out-of-range labels, and missing class coverage."""
+        from pipeline.train_streaming_wavlm import run_dataset_preflight_audit
+        from torch.utils.data import Dataset
+
+        class MockCorruptDataset(Dataset):
+            def __init__(self, corrupt_file: Path):
+                self.items = [(corrupt_file, 0)]
+                self.file_paths = [corrupt_file]
+                self.labels = [0]
+            def __len__(self):
+                return 1
+            def __getitem__(self, idx):
+                return torch.zeros(16000), 0
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            bad_file = Path(tmp_dir) / "corrupt.wav"
+            bad_file.write_bytes(b"RIFF" + b"\x00" * 10)  # Only 14 bytes (< 44)
+            ds_bad = MockCorruptDataset(bad_file)
+            with pytest.raises(ValueError) as exc:
+                run_dataset_preflight_audit([("CorruptSplit", ds_bad)], min_samples=1)
+            assert "corrupt" in str(exc.value).lower() or "size" in str(exc.value).lower()
+
+        class MockLabelDataset(Dataset):
+            def __init__(self):
+                self.items = [(Path("dummy.wav"), 999)]
+                self.labels = [999]
+                self.file_paths = []
+            def __len__(self):
+                return 1
+            def __getitem__(self, idx):
+                return torch.zeros(16000), 999
+
+        with pytest.raises(ValueError) as exc:
+            run_dataset_preflight_audit([("UrbanSound (Train)", MockLabelDataset())], min_samples=1)
+        assert "exceeds" in str(exc.value).lower() or "out of" in str(exc.value).lower() or "inadequate" in str(exc.value).lower()
+
 
 
