@@ -572,7 +572,7 @@ class TestStreamingParityAndEndToEndValidation:
                 self.labels = [0]
             def __len__(self):
                 return 1
-            def __getitem__(self, idx):
+            def __getitem__(self, index):
                 return torch.zeros(16000), 0
 
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -590,7 +590,7 @@ class TestStreamingParityAndEndToEndValidation:
                 self.file_paths = []
             def __len__(self):
                 return 1
-            def __getitem__(self, idx):
+            def __getitem__(self, index):
                 return torch.zeros(16000), 999
 
         with pytest.raises(ValueError) as exc:
@@ -716,8 +716,8 @@ class TestSplitDeterminismAndTrialManifests:
                 self.split = "test_single"
             def __len__(self):
                 return len(self.items)
-            def __getitem__(self, idx):
-                return torch.zeros(16000), self.labels[idx]
+            def __getitem__(self, index):
+                return torch.zeros(16000), self.labels[index]
 
         ds_single = SingleFileSpeakerDataset()
 
@@ -881,7 +881,7 @@ class TestCheckpointResumeAndSafety:
         assert "incompatible" in str(exc.value).lower()
 
         # With force=True, it succeeds
-        assert check_resume(saved_fingerprint, current_fingerprint, force=True) is True
+        assert check_resume(saved_fingerprint, current_fingerprint, force=True)
 
 
 

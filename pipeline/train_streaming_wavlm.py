@@ -222,9 +222,8 @@ class VoxCelebRawDataset(Dataset):
         all_spk_dirs = sorted([d for d in self.vox_root.iterdir() if d.is_dir()])
         if seed is not None:
             rng = np.random.RandomState(seed)
-            shuffled_dirs = list(all_spk_dirs)
-            rng.shuffle(shuffled_dirs)
-            spk_dirs = shuffled_dirs[:max_speakers]
+            perm = rng.permutation(len(all_spk_dirs))
+            spk_dirs = [all_spk_dirs[i] for i in perm][:max_speakers]
         else:
             spk_dirs = all_spk_dirs[:max_speakers]
 
@@ -428,8 +427,8 @@ def run_dataset_preflight_audit(
         if count < min_samples:
             raise ValueError(f"[Preflight Audit Failed] Dataset split '{name}' has {count} samples, fewer than required min_samples={min_samples}.")
 
-        labels: List[int] = getattr(ds, "labels", None)
-        file_paths: List[Path] = getattr(ds, "file_paths", None)
+        labels: Optional[List[int]] = getattr(ds, "labels", None)
+        file_paths: Optional[List[Path]] = getattr(ds, "file_paths", None)
         if labels is None and hasattr(ds, "items") and ds.items:
             labels = [lbl for _, lbl in ds.items]
             file_paths = [fp for fp, _ in ds.items]
@@ -615,8 +614,8 @@ def run_dataset_preflight_audit(
 
 
 def compute_equal_error_rate(
-    genuine_scores: np.ndarray,
-    impostor_scores: np.ndarray,
+    genuine_scores: Union[np.ndarray, Sequence[float]],
+    impostor_scores: Union[np.ndarray, Sequence[float]],
     strict: bool = False,
 ) -> Tuple[float, float, float]:
     """Calculate Equal Error Rate (EER), ROC-AUC, and optimal threshold from genuine & impostor trials.
@@ -625,16 +624,19 @@ def compute_equal_error_rate(
       - If strict=True, raises ValueError.
       - If strict=False, returns (float('nan'), float('nan'), 0.0) with explicit invalid status.
     """
-    if len(genuine_scores) == 0 or len(impostor_scores) == 0:
+    genuine_arr = np.asarray(genuine_scores)
+    impostor_arr = np.asarray(impostor_scores)
+
+    if len(genuine_arr) == 0 or len(impostor_arr) == 0:
         if strict:
             raise ValueError(
-                f"[Evaluation Error] Cannot compute EER: genuine scores ({len(genuine_scores)}) "
-                f"or impostor scores ({len(impostor_scores)}) is empty."
+                f"[Evaluation Error] Cannot compute EER: genuine scores ({len(genuine_arr)}) "
+                f"or impostor scores ({len(impostor_arr)}) is empty."
             )
         return float("nan"), float("nan"), 0.0
 
-    y_true = np.concatenate([np.ones_like(genuine_scores), np.zeros_like(impostor_scores)])
-    y_scores = np.concatenate([genuine_scores, impostor_scores])
+    y_true = np.concatenate([np.ones_like(genuine_arr), np.zeros_like(impostor_arr)])
+    y_scores = np.concatenate([genuine_arr, impostor_arr])
 
     try:
         auc = float(roc_auc_score(y_true, y_scores))
@@ -645,8 +647,8 @@ def compute_equal_error_rate(
     thresholds = np.linspace(-1.0, 1.0, 201)
     far_list, frr_list = [], []
     for th in thresholds:
-        far = np.mean(impostor_scores >= th)
-        frr = np.mean(genuine_scores < th)
+        far = np.mean(impostor_arr >= th)
+        frr = np.mean(genuine_arr < th)
         far_list.append(far)
         frr_list.append(frr)
 
@@ -660,7 +662,7 @@ def compute_equal_error_rate(
 
 
 def generate_speaker_verification_trials(
-    dataset: VoxCelebRawDataset,
+    dataset: Any,
     num_pairs: int = 100,
     seed: int = 42,
     fail_on_insufficient: bool = False,
@@ -733,7 +735,7 @@ def save_voxceleb_splits_manifest(
 
     for split_name, ds in splits.items():
         spk_names = sorted(list(set(ds.speaker_names)))
-        files = [str(fp.as_posix()) for fp in ds.file_paths]
+        files = [fp.as_posix() for fp in ds.file_paths]
         manifest_data["splits"][split_name] = {
             "num_speakers": len(spk_names),
             "speakers": spk_names,
@@ -781,11 +783,11 @@ def save_trials_manifest(
             num_impostor += 1
 
         trial_records.append({
-            "file1": str(f1.as_posix()),
-            "file2": str(f2.as_posix()),
+            "file1": f1.as_posix(),
+            "file2": f2.as_posix(),
             "speaker1": spk1,
             "speaker2": spk2,
-            "label": int(label),
+            "label": label,
         })
 
     manifest_data = {
