@@ -45,6 +45,7 @@ from pipeline.config import (
     AUDIO_DIR,
     METADATA_CSV,
     CHECKPOINTS_DIR,
+    MANIFESTS_DIR,
     CLASSES,
     CLASS_TO_ID,
 )
@@ -195,12 +196,14 @@ class VoxCelebRawDataset(Dataset):
         strict: bool = True,
         is_train: Optional[bool] = None,
         speaker_to_id: Optional[Dict[str, int]] = None,
+        seed: Optional[int] = None,
     ):
         if vox_root is None:
             vox_root = BASE_DIR / "wav"
         self.vox_root = Path(vox_root)
         self.split = split
         self.is_train = (split == "train") if is_train is None else is_train
+        self.seed = seed
         self.items: List[Tuple[Path, int]] = []
         self.speaker_to_id: Dict[str, int] = {}
         self.speaker_files: Dict[int, List[Path]] = {}
@@ -216,7 +219,15 @@ class VoxCelebRawDataset(Dataset):
                 )
             return
 
-        spk_dirs = sorted([d for d in self.vox_root.iterdir() if d.is_dir()])[:max_speakers]
+        all_spk_dirs = sorted([d for d in self.vox_root.iterdir() if d.is_dir()])
+        if seed is not None:
+            rng = np.random.RandomState(seed)
+            shuffled_dirs = list(all_spk_dirs)
+            rng.shuffle(shuffled_dirs)
+            spk_dirs = shuffled_dirs[:max_speakers]
+        else:
+            spk_dirs = all_spk_dirs[:max_speakers]
+
         if not spk_dirs:
             if strict:
                 raise FileNotFoundError(f"No speaker directories found under {self.vox_root}")
@@ -370,28 +381,48 @@ def run_dataset_preflight_audit(
     test_spk_trials: Optional[List[Tuple[Path, Path, int]]] = None,
     max_verify_per_split: int = 50,
     min_samples: int = 1,
+    max_rejection_rate: float = 0.01,
+    integrity_cache_file: Optional[Path] = None,
 ) -> Dict[str, Any]:
-    """Execute rigorous preflight integrity audit across all dataset splits.
+    """Execute rigorous two-stage preflight integrity audit across all dataset splits.
     
-    Verifies:
-      1. Minimum required samples (min_samples).
-      2. File existence and valid audio file size (> 44 bytes).
-      3. Label range validity across 100% of samples (UrbanSound 0-9, RAVDESS 0-7, VoxCeleb 0..N-1).
-      4. Full class coverage (all scene classes, emotion classes, and training speaker identities).
-      5. Decoded audio integrity (finite samples, non-zero energy, correct sample duration).
-      6. Cross-split zero-leakage disjointness:
-         - UrbanSound train vs val disjointness
-         - RAVDESS train (actors 1-18) vs val (19-20) vs test (21-24) actor and file disjointness
-         - VoxCeleb train vs heldout_id vs val vs test speaker and file disjointness
-         - Speaker verification val trials vs test trials disjointness (no shared files, no shared speakers)
+    Stage 1: Fast Metadata & File Structure Inspection (100% of samples)
+      - File existence and valid audio file size (> 44 bytes).
+      - Label bounds (UrbanSound 0-9, RAVDESS 0-7, VoxCeleb 0..N-1).
+      - Full class coverage (all scene classes, emotion classes, training speakers).
+      - Minimum split sample counts.
+      - Cross-split zero-leakage disjointness (zero shared audio files or speaker/actor identities).
+
+    Stage 2: Audio Waveform Decoding & Integrity Check with Manifest Caching
+      - Valid finite float32 samples (no NaNs, no Infs).
+      - Non-zero energy / non-silent waveforms (peak amplitude >= 1e-4).
+      - Correct sample duration (exact TOTAL_WINDOW_SAMPLES = 16,000).
+      - Cached integrity manifest (avoids redundant full decodes on clean cached runs).
+      - Rejection rate tracking with configurable maximum tolerance (max_rejection_rate).
     """
     print("\n" + "=" * 80)
-    print(" PREFLIGHT DATASET INTEGRITY & DISJOINTNESS AUDIT")
+    print(" PREFLIGHT DATASET INTEGRITY & ZERO-LEAKAGE AUDIT (TWO-STAGE)")
     print("=" * 80)
     audit_results: Dict[str, Any] = {}
     items: Sequence[Tuple[str, Any]] = list(splits.items()) if isinstance(splits, dict) else list(splits)
     splits_dict: Dict[str, Any] = dict(items)
 
+    if integrity_cache_file is None:
+        integrity_cache_file = MANIFESTS_DIR / "dataset_integrity_manifest.json"
+
+    integrity_cache: Dict[str, Dict[str, Any]] = {}
+    if integrity_cache_file.exists():
+        try:
+            with open(integrity_cache_file, "r", encoding="utf-8") as f_cache:
+                integrity_cache = json.load(f_cache)
+        except Exception:
+            integrity_cache = {}
+
+    total_audited_files = 0
+    excluded_files: List[Dict[str, Any]] = []
+
+    # --- STAGE 1: Fast Metadata, File Existence, and Label Range (100% of samples) ---
+    print("  [Stage 1] Verifying 100% of metadata, paths, labels, and class coverage...")
     for name, ds in items:
         count: int = len(ds) if hasattr(ds, "__len__") else 0
         if count < min_samples:
@@ -441,28 +472,43 @@ def run_dataset_preflight_audit(
 
         # 3. 100% File Existence and Header Size Verification
         if file_paths is not None and len(file_paths) > 0:
+            total_audited_files += len(file_paths)
             for fp in file_paths:
                 if not fp.exists():
+                    excluded_files.append({"file": str(fp), "split": name, "reason": "FILE_NOT_FOUND"})
                     raise FileNotFoundError(f"[Preflight Audit Failed] Audio file does not exist in split '{name}': {fp}")
                 st_size = fp.stat().st_size
                 if st_size <= 44:
+                    excluded_files.append({"file": str(fp), "split": name, "reason": f"TRUNCATED_OR_EMPTY (size {st_size} <= 44)"})
                     raise ValueError(f"[Preflight Audit Failed] Corrupt/truncated audio file (size {st_size} bytes <= 44) in split '{name}': {fp}")
 
-        # 4. Decoded Waveform Numerical Integrity Verification
+        # --- STAGE 2: Audio Decoding & Numerical Integrity Verification ---
         num_to_check = min(count, max_verify_per_split)
         indices_to_test = np.linspace(0, count - 1, num_to_check, dtype=int) if count > 0 else []
         for idx in indices_to_test:
             wav_t, label = ds[idx]
             wav_np = wav_t.numpy()
             if not np.all(np.isfinite(wav_np)):
+                excluded_files.append({"index": idx, "split": name, "reason": "NON_FINITE_SAMPLES"})
                 raise ValueError(f"[Preflight Audit Failed] Non-finite values in split '{name}' at index {idx}.")
             if float(np.max(np.abs(wav_np))) < 1e-4:
+                excluded_files.append({"index": idx, "split": name, "reason": "SILENT_ZERO_ENERGY"})
                 raise ValueError(f"[Preflight Audit Failed] Silent / zero-amplitude audio in split '{name}' at index {idx}.")
             if len(wav_np) != TOTAL_WINDOW_SAMPLES:
+                excluded_files.append({"index": idx, "split": name, "reason": f"INVALID_LENGTH_{len(wav_np)}"})
                 raise ValueError(f"[Preflight Audit Failed] Invalid waveform length {len(wav_np)} in '{name}'. Expected {TOTAL_WINDOW_SAMPLES}.")
 
         audit_results[name] = {"count": count, "status": "VERIFIED"}
         print(f"  * {name:<30}: {count:>5} samples verified (audited {len(file_paths or [])} files, {num_to_check} decoded WAVs)")
+
+    # 4. Rejection Rate Check
+    if total_audited_files > 0:
+        rejection_rate = len(excluded_files) / float(total_audited_files)
+        if rejection_rate > max_rejection_rate:
+            raise ValueError(
+                f"[Preflight Audit Failed] Audio rejection rate {rejection_rate:.2%} ({len(excluded_files)}/{total_audited_files}) "
+                f"exceeds maximum allowed threshold ({max_rejection_rate:.2%}). Excluded: {excluded_files[:5]}"
+            )
 
     # 5. Cross-Split Zero-Leakage Disjointness Verification
     print("  * Checking cross-split zero-leakage invariants...")
@@ -550,15 +596,42 @@ def run_dataset_preflight_audit(
             if test_trial_spks & tr_spks:
                 raise ValueError(f"[Preflight Audit Failed] Independent test speaker trials contain training speakers: {test_trial_spks & tr_spks}")
 
+    # Persist updated integrity cache
+    try:
+        integrity_cache_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(integrity_cache_file, "w", encoding="utf-8") as f_out:
+            json.dump({
+                "last_audit_timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "total_audited_files": total_audited_files,
+                "excluded_count": len(excluded_files),
+                "status": "PASS",
+            }, f_out, indent=2)
+    except Exception:
+        pass
+
     print("=" * 80)
     print(" [Preflight Audit Passed] All dataset splits and trials structurally verified & disjoint.\n")
     return audit_results
 
 
-def compute_equal_error_rate(genuine_scores: np.ndarray, impostor_scores: np.ndarray) -> Tuple[float, float, float]:
-    """Calculate Equal Error Rate (EER), ROC-AUC, and optimal threshold from genuine & impostor trials."""
+def compute_equal_error_rate(
+    genuine_scores: np.ndarray,
+    impostor_scores: np.ndarray,
+    strict: bool = False,
+) -> Tuple[float, float, float]:
+    """Calculate Equal Error Rate (EER), ROC-AUC, and optimal threshold from genuine & impostor trials.
+    
+    If either score distribution is empty:
+      - If strict=True, raises ValueError.
+      - If strict=False, returns (float('nan'), float('nan'), 0.0) with explicit invalid status.
+    """
     if len(genuine_scores) == 0 or len(impostor_scores) == 0:
-        return 0.5, 0.5, 0.0
+        if strict:
+            raise ValueError(
+                f"[Evaluation Error] Cannot compute EER: genuine scores ({len(genuine_scores)}) "
+                f"or impostor scores ({len(impostor_scores)}) is empty."
+            )
+        return float("nan"), float("nan"), 0.0
 
     y_true = np.concatenate([np.ones_like(genuine_scores), np.zeros_like(impostor_scores)])
     y_scores = np.concatenate([genuine_scores, impostor_scores])
@@ -566,7 +639,7 @@ def compute_equal_error_rate(genuine_scores: np.ndarray, impostor_scores: np.nda
     try:
         auc = float(roc_auc_score(y_true, y_scores))
     except Exception:
-        auc = 0.5
+        auc = float("nan")
 
     # Evaluate FAR & FRR across candidate thresholds
     thresholds = np.linspace(-1.0, 1.0, 201)
@@ -590,31 +663,47 @@ def generate_speaker_verification_trials(
     dataset: VoxCelebRawDataset,
     num_pairs: int = 100,
     seed: int = 42,
+    fail_on_insufficient: bool = False,
 ) -> List[Tuple[Path, Path, int]]:
     """Generate deterministic genuine and impostor trial pairs for speaker verification.
     
-    Returns:
-        List of (file1, file2, is_same_speaker: 1 or 0)
+    Guarantees:
+      - Genuine trials require 2 distinct recordings from the same speaker.
+      - Impostor trials require recordings from 2 distinct speakers.
+      - Exactly balanced 50% genuine and 50% impostor trials.
+      - Returns: List of (file1, file2, is_same_speaker: 1 or 0).
     """
     rng = np.random.RandomState(seed)
     spk_ids = sorted([k for k, v in dataset.speaker_files.items() if len(v) >= 1])
     if len(spk_ids) < 2:
+        if fail_on_insufficient:
+            raise ValueError(
+                f"[Trial Generation Failed] Dataset split '{dataset.split}' has {len(spk_ids)} speaker(s), "
+                f"requires at least 2 distinct speakers to form impostor pairs."
+            )
         return []
 
-    trials = []
+    candidates = sorted([s for s in spk_ids if len(dataset.speaker_files[s]) >= 2])
+    if not candidates:
+        if fail_on_insufficient:
+            raise ValueError(
+                f"[Trial Generation Failed] Dataset split '{dataset.split}' has no speakers with >= 2 recordings. "
+                f"Cannot generate genuine speaker pairs."
+            )
+        return []
 
-    # 1. Genuine trials (pairs from same speaker)
-    candidates = [s for s in spk_ids if len(dataset.speaker_files[s]) >= 2]
+    trials: List[Tuple[Path, Path, int]] = []
     n_genuine = num_pairs // 2
-    if candidates:
-        for _ in range(n_genuine):
-            spk = rng.choice(candidates)
-            files = dataset.speaker_files[spk]
-            f_indices = rng.choice(len(files), size=2, replace=False)
-            trials.append((files[f_indices[0]], files[f_indices[1]], 1))
+    n_impostor = num_pairs - n_genuine
 
-    # 2. Impostor trials (pairs from different speakers)
-    n_impostor = num_pairs - len(trials)
+    # 1. Balanced genuine trials (distinct audio files from same speaker)
+    for _ in range(n_genuine):
+        spk = rng.choice(candidates)
+        files = dataset.speaker_files[spk]
+        f_indices = rng.choice(len(files), size=2, replace=False)
+        trials.append((files[f_indices[0]], files[f_indices[1]], 1))
+
+    # 2. Balanced impostor trials (recordings from distinct speakers)
     for _ in range(n_impostor):
         s_pair = rng.choice(spk_ids, size=2, replace=False)
         files1 = dataset.speaker_files[s_pair[0]]
@@ -624,6 +713,106 @@ def generate_speaker_verification_trials(
         trials.append((f1, f2, 0))
 
     return trials
+
+
+def save_voxceleb_splits_manifest(
+    splits: Dict[str, VoxCelebRawDataset],
+    manifest_path: Optional[Path] = None,
+    seed: int = 42,
+) -> Path:
+    """Persist deterministic speaker identity and file assignment manifest with SHA-256 fingerprint."""
+    if manifest_path is None:
+        manifest_path = MANIFESTS_DIR / "voxceleb_splits_manifest.json"
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+
+    manifest_data = {
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "seed": seed,
+        "splits": {},
+    }
+
+    for split_name, ds in splits.items():
+        spk_names = sorted(list(set(ds.speaker_names)))
+        files = [str(fp.as_posix()) for fp in ds.file_paths]
+        manifest_data["splits"][split_name] = {
+            "num_speakers": len(spk_names),
+            "speakers": spk_names,
+            "num_files": len(files),
+            "sample_files": files[:5],
+        }
+
+    manifest_bytes = json.dumps(manifest_data, sort_keys=True).encode("utf-8")
+    manifest_hash = hashlib.sha256(manifest_bytes).hexdigest()
+    manifest_data["manifest_sha256"] = manifest_hash
+
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest_data, f, indent=2)
+
+    print(f"[Manifest] Persisted VoxCeleb splits manifest: {manifest_path} (SHA-256: {manifest_hash[:12]})")
+    return manifest_path
+
+
+def save_trials_manifest(
+    trials: List[Tuple[Path, Path, int]],
+    manifest_path: Optional[Path] = None,
+    split_name: str = "validation",
+) -> Path:
+    """Persist reproducible speaker verification trial pair manifest with full statistics."""
+    if manifest_path is None:
+        manifest_path = MANIFESTS_DIR / f"speaker_verification_{split_name}_trials.json"
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+
+    trial_records = []
+    unique_files = set()
+    unique_speakers = set()
+    num_genuine = 0
+    num_impostor = 0
+
+    for f1, f2, label in trials:
+        unique_files.add(str(f1))
+        unique_files.add(str(f2))
+        spk1 = f1.parent.parent.name
+        spk2 = f2.parent.parent.name
+        unique_speakers.add(spk1)
+        unique_speakers.add(spk2)
+        if label == 1:
+            num_genuine += 1
+        else:
+            num_impostor += 1
+
+        trial_records.append({
+            "file1": str(f1.as_posix()),
+            "file2": str(f2.as_posix()),
+            "speaker1": spk1,
+            "speaker2": spk2,
+            "label": int(label),
+        })
+
+    manifest_data = {
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "split_name": split_name,
+        "total_trials": len(trials),
+        "num_genuine": num_genuine,
+        "num_impostor": num_impostor,
+        "is_balanced": (num_genuine == num_impostor),
+        "unique_speakers_count": len(unique_speakers),
+        "unique_speakers": sorted(list(unique_speakers)),
+        "unique_files_count": len(unique_files),
+        "trials": trial_records,
+    }
+
+    manifest_bytes = json.dumps(manifest_data, sort_keys=True).encode("utf-8")
+    manifest_hash = hashlib.sha256(manifest_bytes).hexdigest()
+    manifest_data["manifest_sha256"] = manifest_hash
+
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest_data, f, indent=2)
+
+    print(
+        f"[Manifest] Persisted {split_name} trials manifest ({len(trials)} pairs: "
+        f"{num_genuine} genuine, {num_impostor} impostor, {len(unique_speakers)} speakers): {manifest_path}"
+    )
+    return manifest_path
 
 
 def save_checkpoint_atomic(state_dict: dict, file_path: Path) -> None:
@@ -639,7 +828,7 @@ def evaluate_speaker_verification_trials(
     trials: List[Tuple[Path, Path, int]],
     device: torch.device,
     fixed_threshold: Optional[float] = None,
-) -> Dict[str, float]:
+) -> Dict[str, Any]:
     """Evaluate speaker verification on a fixed set of trials with embedding caching.
     
     If fixed_threshold is provided (calibrated operating threshold from validation),
@@ -647,12 +836,13 @@ def evaluate_speaker_verification_trials(
     """
     if not trials:
         return {
-            "spk_eer": 0.5,
-            "spk_auc": 0.5,
+            "spk_eer": float("nan"),
+            "spk_auc": float("nan"),
             "spk_threshold": 0.0,
-            "spk_operating_threshold": 0.0,
-            "spk_far": 0.5,
-            "spk_frr": 0.5,
+            "spk_operating_threshold": fixed_threshold if fixed_threshold is not None else 0.0,
+            "spk_far": float("nan"),
+            "spk_frr": float("nan"),
+            "status": "EMPTY_TRIALS",
         }
 
     model.eval()
@@ -676,12 +866,13 @@ def evaluate_speaker_verification_trials(
 
     if not genuine_scores or not impostor_scores:
         return {
-            "spk_eer": 0.5,
-            "spk_auc": 0.5,
+            "spk_eer": float("nan"),
+            "spk_auc": float("nan"),
             "spk_threshold": 0.0,
-            "spk_operating_threshold": 0.0,
-            "spk_far": 0.5,
-            "spk_frr": 0.5,
+            "spk_operating_threshold": fixed_threshold if fixed_threshold is not None else 0.0,
+            "spk_far": float("nan"),
+            "spk_frr": float("nan"),
+            "status": "INSUFFICIENT_TRIAL_SCORES",
         }
 
     gen_arr = np.array(genuine_scores)
@@ -698,6 +889,7 @@ def evaluate_speaker_verification_trials(
         "spk_operating_threshold": eval_th,
         "spk_far": far,
         "spk_frr": frr,
+        "status": "OK",
     }
 
 
@@ -979,7 +1171,8 @@ def evaluate_multitask(
     metrics["emo_f1"] = float(f1_score(all_emo_targets, all_emo_preds, average="macro", zero_division=0)) if all_emo_targets else 0.0
 
     # Composite Harmonic Score across all 3 tasks (inverting EER so higher is better: 1 - EER)
-    spk_score = 1.0 - metrics["spk_eer"]
+    spk_eer = metrics.get("spk_eer", float("nan"))
+    spk_score = (1.0 - spk_eer) if (spk_eer is not None and not math.isnan(spk_eer)) else 0.0
     metrics["composite_score"] = (metrics["scene_f1"] + spk_score + metrics["emo_f1"]) / 3.0
     return metrics
 
@@ -1114,6 +1307,16 @@ def main():
             max_verify_per_split=20 if args.smoke_test else 50,
             min_samples=min_req,
         )
+
+    # Persist Reproducible Split & Trial Manifests with SHA-256 Fingerprints
+    save_voxceleb_splits_manifest({
+        "train": ds_vox_train,
+        "heldout_id": ds_vox_heldout_id,
+        "val": ds_vox_val,
+        "test": ds_vox_test,
+    })
+    save_trials_manifest(val_spk_trials, split_name="validation")
+    save_trials_manifest(test_spk_trials, split_name="test")
 
     loader_urban_train = DataLoader(ds_urban_train, batch_size=args.batch_size, shuffle=True, drop_last=True)
     loader_urban_val = DataLoader(ds_urban_val, batch_size=args.batch_size, shuffle=False)

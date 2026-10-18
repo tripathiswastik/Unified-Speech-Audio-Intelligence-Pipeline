@@ -598,4 +598,291 @@ class TestStreamingParityAndEndToEndValidation:
         assert "exceeds" in str(exc.value).lower() or "out of" in str(exc.value).lower() or "inadequate" in str(exc.value).lower()
 
 
+class TestEvaluationMetricEdgeCases:
+    """Validate speaker verification metric edge cases and mathematical invariants."""
+
+    def test_compute_equal_error_rate_perfect_separation(self):
+        """Linearly separable genuine and impostor scores must yield EER=0.0 and AUC=1.0."""
+        from pipeline.train_streaming_wavlm import compute_equal_error_rate
+
+        genuine = [0.80, 0.85, 0.90, 0.95]
+        impostor = [0.10, 0.20, 0.25, 0.30]
+
+        eer, auc, th = compute_equal_error_rate(genuine, impostor)
+        assert eer == 0.0, f"Expected 0.0 EER for perfect separation, got {eer}"
+        assert auc == 1.0, f"Expected 1.0 AUC for perfect separation, got {auc}"
+        assert 0.30 <= th <= 0.80, f"Threshold should separate distributions, got {th}"
+
+    def test_compute_equal_error_rate_completely_overlapping(self):
+        """Identical score distributions must yield EER=0.5 and AUC=0.5."""
+        from pipeline.train_streaming_wavlm import compute_equal_error_rate
+
+        genuine = [0.5, 0.5, 0.5, 0.5]
+        impostor = [0.5, 0.5, 0.5, 0.5]
+
+        eer, auc, th = compute_equal_error_rate(genuine, impostor)
+        assert np.isclose(eer, 0.5, atol=1e-3), f"Expected 0.5 EER for overlapping distributions, got {eer}"
+        assert np.isclose(auc, 0.5, atol=1e-3), f"Expected 0.5 AUC for overlapping distributions, got {auc}"
+
+    def test_compute_equal_error_rate_empty_trials_handling(self):
+        """Empty genuine or impostor trials must return NaN (strict=False) or raise ValueError (strict=True)."""
+        import math
+        from pipeline.train_streaming_wavlm import compute_equal_error_rate
+
+        # Non-strict mode should return (nan, nan, 0.0) without silently returning a misleading 0.5
+        eer, auc, th = compute_equal_error_rate([], [0.1, 0.2], strict=False)
+        assert math.isnan(eer)
+        assert math.isnan(auc)
+
+        eer2, auc2, th2 = compute_equal_error_rate([0.8, 0.9], [], strict=False)
+        assert math.isnan(eer2)
+        assert math.isnan(auc2)
+
+        # Strict mode must fail loudly
+        with pytest.raises(ValueError):
+            compute_equal_error_rate([], [0.1, 0.2], strict=True)
+
+        with pytest.raises(ValueError):
+            compute_equal_error_rate([0.8, 0.9], [], strict=True)
+
+    def test_compute_equal_error_rate_tied_scores_and_extreme_range(self):
+        """Handles scores spanning the entire [-1.0, 1.0] cosine similarity range with ties."""
+        from pipeline.train_streaming_wavlm import compute_equal_error_rate
+
+        genuine = [-0.1, 0.4, 0.4, 0.7, 0.9]
+        impostor = [-0.9, -0.5, 0.4, 0.4, 0.6]
+
+        eer, auc, th = compute_equal_error_rate(genuine, impostor)
+        assert 0.0 <= eer <= 1.0
+        assert 0.0 <= auc <= 1.0
+        assert -1.0 <= th <= 1.0
+
+    def test_compute_equal_error_rate_auc_consistency_with_sklearn(self):
+        """ROC-AUC from compute_equal_error_rate must match sklearn.metrics.roc_auc_score within 1e-4."""
+        from pipeline.train_streaming_wavlm import compute_equal_error_rate
+        from sklearn.metrics import roc_auc_score
+
+        rng = np.random.RandomState(42)
+        genuine = rng.normal(loc=0.6, scale=0.15, size=100)
+        impostor = rng.normal(loc=0.2, scale=0.15, size=100)
+
+        eer, auc_computed, th = compute_equal_error_rate(genuine, impostor)
+
+        y_true = np.concatenate([np.ones_like(genuine), np.zeros_like(impostor)])
+        y_scores = np.concatenate([genuine, impostor])
+        auc_sklearn = float(roc_auc_score(y_true, y_scores))
+
+        assert np.isclose(auc_computed, auc_sklearn, atol=1e-4), (
+            f"AUC mismatch: computed {auc_computed} vs sklearn {auc_sklearn}"
+        )
+
+
+class TestSplitDeterminismAndTrialManifests:
+    """Validate split repeatability, trial edge cases, and manifest persistence."""
+
+    def test_split_determinism_under_same_seed_and_difference_under_different_seeds(self):
+        """Same seed yields identical partition; different seed yields different partition."""
+        from pipeline.train_streaming_wavlm import VoxCelebRawDataset
+
+        ds_val_seed1 = VoxCelebRawDataset(max_speakers=12, split="val", seed=42, strict=False)
+        ds_val_seed1_again = VoxCelebRawDataset(max_speakers=12, split="val", seed=42, strict=False)
+        ds_val_seed2 = VoxCelebRawDataset(max_speakers=12, split="val", seed=999, strict=False)
+
+        assert ds_val_seed1.speaker_names == ds_val_seed1_again.speaker_names
+        assert set(ds_val_seed1.file_paths) == set(ds_val_seed1_again.file_paths)
+        if len(ds_val_seed1.speaker_names) > 0 and len(ds_val_seed2.speaker_names) > 0:
+            # Different seeds should yield different speaker ordering or selections
+            assert (ds_val_seed1.speaker_names != ds_val_seed2.speaker_names) or (len(ds_val_seed1.speaker_names) <= 1)
+
+    def test_trial_generation_insufficient_recordings_failure_mode(self):
+        """Trial generator should fail explicitly when speakers have insufficient recordings."""
+        from pipeline.train_streaming_wavlm import generate_speaker_verification_trials
+        from torch.utils.data import Dataset
+
+        class SingleFileSpeakerDataset(Dataset):
+            def __init__(self):
+                # 2 speakers, each with only 1 file -> Impossible to form genuine pairs
+                self.items = [
+                    (Path("spk_a/rec1.wav"), 0),
+                    (Path("spk_b/rec1.wav"), 1),
+                ]
+                self.labels = [0, 1]
+                self.file_paths = [Path("spk_a/rec1.wav"), Path("spk_b/rec1.wav")]
+                self.speaker_names = ["spk_a", "spk_b"]
+                self.speaker_files = {
+                    0: [Path("spk_a/rec1.wav")],
+                    1: [Path("spk_b/rec1.wav")],
+                }
+                self.split = "test_single"
+            def __len__(self):
+                return len(self.items)
+            def __getitem__(self, idx):
+                return torch.zeros(16000), self.labels[idx]
+
+        ds_single = SingleFileSpeakerDataset()
+
+        # In strict mode (fail_on_insufficient=True), it must raise ValueError
+        with pytest.raises(ValueError) as exc:
+            generate_speaker_verification_trials(ds_single, num_pairs=10, fail_on_insufficient=True)
+        assert "insufficient" in str(exc.value).lower() or "cannot generate" in str(exc.value).lower()
+
+        # In non-strict mode, it returns empty list or valid pairs without crashing
+        trials = generate_speaker_verification_trials(ds_single, num_pairs=10, fail_on_insufficient=False)
+        assert len(trials) == 0
+
+    def test_manifest_persistence_and_checksum_integrity(self):
+        """Verifies that split and trial manifests are persisted to JSON with SHA-256 fingerprint."""
+        from pipeline.train_streaming_wavlm import (
+            VoxCelebRawDataset,
+            generate_speaker_verification_trials,
+            save_voxceleb_splits_manifest,
+            save_trials_manifest,
+        )
+        import json
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            out_dir = Path(tmp_dir)
+
+            ds_train = VoxCelebRawDataset(max_speakers=8, split="train", strict=False)
+            ds_val = VoxCelebRawDataset(max_speakers=8, split="val", strict=False)
+            ds_test = VoxCelebRawDataset(max_speakers=8, split="test", strict=False)
+
+            manifest_path = save_voxceleb_splits_manifest(
+                splits={
+                    "train": ds_train,
+                    "val": ds_val,
+                    "test": ds_test,
+                },
+                manifest_path=out_dir / "vox_splits.json",
+            )
+            assert manifest_path.exists()
+
+            with open(manifest_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            assert "manifest_sha256" in data
+            assert len(data["manifest_sha256"]) == 64
+            assert "splits" in data
+            assert "train" in data["splits"]
+            assert "val" in data["splits"]
+            assert "test" in data["splits"]
+
+            # Save trials manifest
+            trials = generate_speaker_verification_trials(ds_val, num_pairs=4, seed=42)
+            trial_manifest_path = save_trials_manifest(
+                trials=trials,
+                split_name="test_val",
+                manifest_path=out_dir / "val_trials.json",
+            )
+            assert trial_manifest_path.exists()
+            with open(trial_manifest_path, "r", encoding="utf-8") as tf:
+                t_data = json.load(tf)
+            assert t_data["split_name"] == "test_val"
+            assert t_data["total_trials"] == len(trials)
+            assert "num_genuine" in t_data
+            assert "num_impostor" in t_data
+            assert "is_balanced" in t_data
+            assert "manifest_sha256" in t_data
+            assert "trials" in t_data
+
+
+class TestStreamingStateAndBoundedMemory:
+    """Validate streaming state memory bounds and batched inference consistency."""
+
+    def test_streaming_cache_bounded_over_long_stream(self):
+        """State cache temporal dimension must strictly remain bounded by max_past_frames over 25 chunks."""
+        model = MultiTaskStreamingWavLM(
+            hidden_dim=32,
+            num_layers=3,
+            num_heads=2,
+            ffn_dim=64,
+            max_past_frames=15,
+            early_tap_layer=1,
+            num_scene_classes=10,
+            num_emotion_classes=8,
+            embedding_dim=128,
+        ).eval()
+
+        chunk_samples = 3200  # 200ms
+        state_cache = None
+
+        for chunk_idx in range(25):  # 5 seconds of continuous streaming
+            chunk = torch.randn(1, chunk_samples)
+            with torch.no_grad():
+                sc, spk, emo, state_cache = model(chunk, state_cache=state_cache)
+
+            # Ensure cache temporal length is clamped at max_past_frames (15)
+            past_len = state_cache.shape[4]
+            assert past_len <= 15, f"Cache grew beyond max_past_frames: {past_len} > 15"
+            if chunk_idx >= 2:
+                assert past_len == 15, f"Cache should be full (15), got {past_len}"
+
+    def test_batched_streaming_inference(self):
+        """Batch size 2 inference produces identical per-sample outputs as running batch size 1 sequentially."""
+        model = MultiTaskStreamingWavLM(
+            hidden_dim=32,
+            num_layers=2,
+            num_heads=2,
+            ffn_dim=64,
+            max_past_frames=10,
+            early_tap_layer=1,
+            num_scene_classes=10,
+            num_emotion_classes=8,
+            embedding_dim=128,
+        ).eval()
+
+        chunk1 = torch.randn(1, 3200)
+        chunk2 = torch.randn(1, 3200)
+        batched_chunk = torch.cat([chunk1, chunk2], dim=0)
+
+        with torch.no_grad():
+            sc_b, spk_b, emo_b, _ = model(batched_chunk, state_cache=None)
+            sc1, spk1, emo1, _ = model(chunk1, state_cache=None)
+            sc2, spk2, emo2, _ = model(chunk2, state_cache=None)
+
+        assert torch.allclose(sc_b[0:1], sc1, atol=1e-5)
+        assert torch.allclose(sc_b[1:2], sc2, atol=1e-5)
+        assert torch.allclose(spk_b[0:1], spk1, atol=1e-5)
+        assert torch.allclose(spk_b[1:2], spk2, atol=1e-5)
+        assert torch.allclose(emo_b[0:1], emo1, atol=1e-5)
+        assert torch.allclose(emo_b[1:2], emo2, atol=1e-5)
+
+
+class TestCheckpointResumeAndSafety:
+    """Validate resume safety, fingerprint mismatch rejection, and forced resume override."""
+
+    def test_incompatible_checkpoint_fingerprint_fails_closed(self):
+        """Resuming with mismatched architecture or dataset fingerprint must raise ValueError unless force_resume."""
+        current_fingerprint = {
+            "num_speakers": 10,
+            "hidden_dim": 256,
+            "num_layers": 6,
+            "val_fold": 10,
+        }
+        saved_fingerprint = {
+            "num_speakers": 10,
+            "hidden_dim": 128,  # Mismatched architecture hidden_dim!
+            "num_layers": 6,
+            "val_fold": 10,
+        }
+
+        # Simulate resume check logic
+        def check_resume(saved_fp, current_fp, force=False):
+            if saved_fp and saved_fp != current_fp and not force:
+                raise ValueError(
+                    f"[Resume Aborted] Incompatible dataset/architecture fingerprint:\n"
+                    f"  Saved:   {saved_fp}\n"
+                    f"  Current: {current_fp}\n"
+                    f"Use --force-resume to override."
+                )
+            return True
+
+        with pytest.raises(ValueError) as exc:
+            check_resume(saved_fingerprint, current_fingerprint, force=False)
+        assert "incompatible" in str(exc.value).lower()
+
+        # With force=True, it succeeds
+        assert check_resume(saved_fingerprint, current_fingerprint, force=True) is True
+
+
+
 

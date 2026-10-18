@@ -9,6 +9,7 @@ METADATA_CSV = DATASET_DIR / "metadata" / "UrbanSound8K.csv"
 OUTPUT_DIR = BASE_DIR / "pipeline_output"
 CHECKPOINTS_DIR = OUTPUT_DIR / "checkpoints"
 CACHE_DIR = OUTPUT_DIR / "cache"
+MANIFESTS_DIR = OUTPUT_DIR / "manifests"
 
 # Audio Preprocessing Specs (Aligned with Modern Sound ML Standards)
 SAMPLE_RATE = 22050
