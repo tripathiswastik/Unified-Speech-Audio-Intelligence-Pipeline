@@ -15,6 +15,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 from pipeline.streaming_wavlm import CausalMultiTaskAudioTransformer
 from pipeline.config import CHECKPOINTS_DIR
+from pipeline.device import safe_torch_load
 
 CHUNK_SAMPLES = 3200  # 200ms at 16kHz
 PAST_FRAMES = 40
@@ -37,7 +38,7 @@ def profile_pytorch_latency(
     model = CausalMultiTaskAudioTransformer().to(device)
     ckpt = CHECKPOINTS_DIR / "best_multitask_streaming_wavlm.pt"
     if ckpt.exists():
-        model.load_state_dict(torch.load(ckpt, map_location=device))
+        model.load_state_dict(safe_torch_load(ckpt, map_location=device))
     model.eval()
 
     dummy_chunk = torch.randn(1, CHUNK_SAMPLES, device=device)

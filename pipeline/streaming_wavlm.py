@@ -25,6 +25,7 @@ import torch.nn.functional as F
 
 from pipeline.config import CHECKPOINTS_DIR, CLASSES, SAMPLE_RATE
 from pipeline.emotion_dataset import EMOTIONS
+from pipeline.device import safe_torch_load
 
 
 class CausalConv1d(nn.Module):
@@ -416,7 +417,7 @@ def export_streaming_wavlm_to_onnx(
 
     model = CausalMultiTaskAudioTransformer()
     if checkpoint_path is not None and Path(checkpoint_path).exists():
-        state_dict = torch.load(checkpoint_path, map_location="cpu")
+        state_dict = safe_torch_load(checkpoint_path, map_location="cpu")
         model.load_state_dict(state_dict, strict=True)
         # Compute SHA-256 for provenance
         with open(checkpoint_path, "rb") as f:

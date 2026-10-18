@@ -6,7 +6,7 @@ Validates:
 3. Multi-task head outputs (Scene, Voiceprint, Emotion).
 4. Static-shape ONNX export and ONNX Runtime inference numerical equivalence.
 """
-from typing import Any
+from typing import Any, Optional, Dict, List, Set, Tuple
 import tempfile
 from pathlib import Path
 import numpy as np
@@ -22,6 +22,38 @@ from pipeline.streaming_wavlm import (
     MultiTaskStreamingWavLM,
     export_streaming_wavlm_to_onnx,
 )
+from pipeline.device import safe_torch_load
+
+
+def _get_or_create_test_vox_root(target_dir: Optional[Path] = None) -> Path:
+    """Returns real VoxCeleb root if populated with audio, or creates synthetic mock files for CI."""
+    from pipeline.config import BASE_DIR
+    real_vox = BASE_DIR / "wav"
+    if real_vox.exists():
+        spk_dirs = [d for d in real_vox.iterdir() if d.is_dir()]
+        if len(spk_dirs) >= 8 and any(len(list(d.glob("*/*.wav"))) > 0 for d in spk_dirs[:8]):
+            return real_vox
+
+    if target_dir is None:
+        target_root = Path(tempfile.mkdtemp(prefix="mock_voxceleb_"))
+    else:
+        target_root = Path(target_dir)
+
+    import wave
+    for i in range(12):
+        spk_dir = target_root / f"id100{i:02d}"
+        for v in range(2):
+            vid_dir = spk_dir / f"vid_{v:02d}"
+            vid_dir.mkdir(parents=True, exist_ok=True)
+            for f in range(4):
+                wav_file = vid_dir / f"{f:05d}.wav"
+                if not wav_file.exists():
+                    with wave.open(str(wav_file), "wb") as wf:
+                        wf.setnchannels(1)
+                        wf.setsampwidth(2)
+                        wf.setframerate(16000)
+                        wf.writeframes(b"\x00" * 3200)
+    return target_root
 
 
 class TestStreamingWavLMArchitecture:
@@ -476,7 +508,7 @@ class TestStreamingParityAndEndToEndValidation:
             tmp_files = list(Path(tmp_dir).glob("*.tmp*"))
             assert len(tmp_files) == 0
 
-            loaded = torch.load(ckpt_path)
+            loaded = safe_torch_load(ckpt_path, weights_only=False)
             assert loaded["epoch"] == 5
             assert loaded["best_composite"] == 0.88
 
@@ -484,10 +516,11 @@ class TestStreamingParityAndEndToEndValidation:
         """Verify VoxCeleb train, heldout_id, val, and test splits have completely disjoint identities and files."""
         from pipeline.train_streaming_wavlm import VoxCelebRawDataset
 
-        ds_train = VoxCelebRawDataset(max_speakers=8, split="train", strict=False)
-        ds_heldout = VoxCelebRawDataset(max_speakers=8, split="heldout_id", speaker_to_id=ds_train.speaker_to_id, strict=False)
-        ds_val = VoxCelebRawDataset(max_speakers=8, split="val", strict=False)
-        ds_test = VoxCelebRawDataset(max_speakers=8, split="test", strict=False)
+        vox_root = _get_or_create_test_vox_root()
+        ds_train = VoxCelebRawDataset(vox_root=vox_root, max_speakers=8, split="train", strict=False)
+        ds_heldout = VoxCelebRawDataset(vox_root=vox_root, max_speakers=8, split="heldout_id", speaker_to_id=ds_train.speaker_to_id, strict=False)
+        ds_val = VoxCelebRawDataset(vox_root=vox_root, max_speakers=8, split="val", strict=False)
+        ds_test = VoxCelebRawDataset(vox_root=vox_root, max_speakers=8, split="test", strict=False)
 
         assert len(ds_train) > 0 and len(ds_heldout) > 0 and len(ds_val) > 0 and len(ds_test) > 0
 
@@ -515,9 +548,10 @@ class TestStreamingParityAndEndToEndValidation:
         """Verify that validation and test speaker verification trials do not overlap in files or speaker identities."""
         from pipeline.train_streaming_wavlm import VoxCelebRawDataset, generate_speaker_verification_trials
 
-        ds_train = VoxCelebRawDataset(max_speakers=8, split="train", strict=False)
-        ds_val = VoxCelebRawDataset(max_speakers=8, split="val", strict=False)
-        ds_test = VoxCelebRawDataset(max_speakers=8, split="test", strict=False)
+        vox_root = _get_or_create_test_vox_root()
+        ds_train = VoxCelebRawDataset(vox_root=vox_root, max_speakers=8, split="train", strict=False)
+        ds_val = VoxCelebRawDataset(vox_root=vox_root, max_speakers=8, split="val", strict=False)
+        ds_test = VoxCelebRawDataset(vox_root=vox_root, max_speakers=8, split="test", strict=False)
 
         val_trials = generate_speaker_verification_trials(ds_val, num_pairs=10, seed=42)
         test_trials = generate_speaker_verification_trials(ds_test, num_pairs=10, seed=1337)
@@ -545,8 +579,9 @@ class TestStreamingParityAndEndToEndValidation:
         """Verify that run_dataset_preflight_audit raises ValueError if trials or speakers overlap across splits."""
         from pipeline.train_streaming_wavlm import VoxCelebRawDataset, generate_speaker_verification_trials, run_dataset_preflight_audit
 
-        ds_val = VoxCelebRawDataset(max_speakers=8, split="val", strict=False)
-        ds_test = VoxCelebRawDataset(max_speakers=8, split="test", strict=False)
+        vox_root = _get_or_create_test_vox_root()
+        ds_val = VoxCelebRawDataset(vox_root=vox_root, max_speakers=8, split="val", strict=False)
+        ds_test = VoxCelebRawDataset(vox_root=vox_root, max_speakers=8, split="test", strict=False)
 
         val_trials = generate_speaker_verification_trials(ds_val, num_pairs=4, seed=42)
         # Artificially contaminate test trials with a validation trial
@@ -685,9 +720,10 @@ class TestSplitDeterminismAndTrialManifests:
         """Same seed yields identical partition; different seed yields different partition."""
         from pipeline.train_streaming_wavlm import VoxCelebRawDataset
 
-        ds_val_seed1 = VoxCelebRawDataset(max_speakers=12, split="val", seed=42, strict=False)
-        ds_val_seed1_again = VoxCelebRawDataset(max_speakers=12, split="val", seed=42, strict=False)
-        ds_val_seed2 = VoxCelebRawDataset(max_speakers=12, split="val", seed=999, strict=False)
+        vox_root = _get_or_create_test_vox_root()
+        ds_val_seed1 = VoxCelebRawDataset(vox_root=vox_root, max_speakers=12, split="val", seed=42, strict=False)
+        ds_val_seed1_again = VoxCelebRawDataset(vox_root=vox_root, max_speakers=12, split="val", seed=42, strict=False)
+        ds_val_seed2 = VoxCelebRawDataset(vox_root=vox_root, max_speakers=12, split="val", seed=999, strict=False)
 
         assert ds_val_seed1.speaker_names == ds_val_seed1_again.speaker_names
         assert set(ds_val_seed1.file_paths) == set(ds_val_seed1_again.file_paths)
@@ -744,9 +780,10 @@ class TestSplitDeterminismAndTrialManifests:
         with tempfile.TemporaryDirectory() as tmp_dir:
             out_dir = Path(tmp_dir)
 
-            ds_train = VoxCelebRawDataset(max_speakers=8, split="train", strict=False)
-            ds_val = VoxCelebRawDataset(max_speakers=8, split="val", strict=False)
-            ds_test = VoxCelebRawDataset(max_speakers=8, split="test", strict=False)
+            vox_root = _get_or_create_test_vox_root(out_dir)
+            ds_train = VoxCelebRawDataset(vox_root=vox_root, max_speakers=8, split="train", strict=False)
+            ds_val = VoxCelebRawDataset(vox_root=vox_root, max_speakers=8, split="val", strict=False)
+            ds_test = VoxCelebRawDataset(vox_root=vox_root, max_speakers=8, split="test", strict=False)
 
             manifest_path = save_voxceleb_splits_manifest(
                 splits={

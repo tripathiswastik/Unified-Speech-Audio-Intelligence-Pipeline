@@ -20,6 +20,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 from pipeline.config import CHECKPOINTS_DIR, OUTPUT_DIR, CLASSES
 from pipeline.emotion_dataset import EMOTIONS
+from pipeline.device import safe_torch_load
 from pipeline.streaming_wavlm import (
     CausalMultiTaskAudioTransformer,
     export_streaming_wavlm_to_onnx,
@@ -46,7 +47,7 @@ def validate_sequential_streaming_parity(
 
     # 1. Initialize PyTorch model with trained weights
     pt_model = CausalMultiTaskAudioTransformer()
-    pt_state = torch.load(pytorch_ckpt_path, map_location="cpu")
+    pt_state = safe_torch_load(pytorch_ckpt_path, map_location="cpu")
     pt_model.load_state_dict(pt_state)
     pt_model.eval()
 

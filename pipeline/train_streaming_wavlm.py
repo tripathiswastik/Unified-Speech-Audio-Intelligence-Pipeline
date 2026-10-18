@@ -56,7 +56,7 @@ from pipeline.streaming_wavlm import (
     export_streaming_wavlm_to_onnx,
 )
 from pipeline.model import ArcMarginProduct
-from pipeline.device import get_device
+from pipeline.device import get_device, safe_torch_load
 from pipeline.ruflo_tracker import RufloExperimentTracker
 
 
@@ -1400,7 +1400,7 @@ def main():
     }
 
     if args.resume and latest_ckpt_path.exists():
-        saved_state = torch.load(latest_ckpt_path, map_location=device)
+        saved_state = safe_torch_load(latest_ckpt_path, map_location=device)
         saved_fingerprint = saved_state.get("config_fingerprint", {})
         if saved_fingerprint and saved_fingerprint != current_fingerprint and not args.force_resume:
             raise ValueError(
@@ -1540,7 +1540,7 @@ def main():
     eval_model_path = promoted_ckpt_path if promoted_ckpt_path.exists() else best_ckpt_path
     if eval_model_path.exists() and len(ds_ravdess_test) > 0:
         print(f"\n[Independent Benchmark] Evaluating {eval_model_path.name} on clean test sets...")
-        model.load_state_dict(torch.load(eval_model_path, map_location=device))
+        model.load_state_dict(safe_torch_load(eval_model_path, map_location=device))
         test_results = evaluate_independent_test(
             model=model,
             loader_ravdess_test=loader_ravdess_test,
@@ -1578,7 +1578,7 @@ def main():
             num_emotion_classes=len(EMOTIONS),
             embedding_dim=128,
         )
-        fresh_model.load_state_dict(torch.load(best_ckpt_path, map_location="cpu"))
+        fresh_model.load_state_dict(safe_torch_load(best_ckpt_path, map_location="cpu"))
         fresh_model.eval()
 
         # 3. Numerical inference sanity check
