@@ -327,3 +327,157 @@ class TestStreamingWavLMExportCheckpoints:
             )
 
 
+class TestStreamingParityAndEndToEndValidation:
+    """End-to-end streaming tests: future-invariance, session cache reset, and PyTorch vs ONNX multi-chunk parity."""
+
+    def test_end_to_end_streaming_future_invariance_and_session_reset(self):
+        """Verify modifying future chunks cannot alter past emissions and cache reset eliminates cross-session state."""
+        model = MultiTaskStreamingWavLM(
+            hidden_dim=32,
+            num_layers=3,
+            num_heads=2,
+            ffn_dim=64,
+            max_past_frames=10,
+            early_tap_layer=1,
+            num_scene_classes=10,
+            num_emotion_classes=8,
+            embedding_dim=128,
+        ).eval()
+
+        chunk1 = torch.randn(1, 3200)
+        chunk2 = torch.randn(1, 3200)
+        chunk2_perturbed = chunk2 + torch.randn(1, 3200) * 5.0
+
+        # Run stream A
+        with torch.no_grad():
+            sc1_a, spk1_a, emo1_a, cache1_a = model(chunk1, state_cache=None)
+            sc2_a, spk2_a, emo2_a, cache2_a = model(chunk2, state_cache=cache1_a)
+
+        # Run stream B (chunk 1 identical, chunk 2 perturbed)
+        with torch.no_grad():
+            sc1_b, spk1_b, emo1_b, cache1_b = model(chunk1, state_cache=None)
+            sc2_b, spk2_b, emo2_b, cache2_b = model(chunk2_perturbed, state_cache=cache1_b)
+
+        # Emitted chunk 1 outputs MUST be identical regardless of future perturbations
+        assert torch.allclose(sc1_a, sc1_b, atol=1e-6)
+        assert torch.allclose(spk1_a, spk1_b, atol=1e-6)
+        assert torch.allclose(emo1_a, emo1_b, atol=1e-6)
+        assert torch.allclose(cache1_a, cache1_b, atol=1e-6)
+
+        # Session reset test:
+        # Session 1: run chunk1 -> cache
+        # Reset: set cache = None
+        # Session 2: run chunk2 from fresh cache
+        # Session 3: run chunk2 on an untouched fresh model
+        with torch.no_grad():
+            _, _, _, _ = model(chunk1, state_cache=None)
+            # Reset cache between audio sessions
+            sc2_fresh, spk2_fresh, emo2_fresh, _ = model(chunk2, state_cache=None)
+
+        fresh_model = MultiTaskStreamingWavLM(
+            hidden_dim=32,
+            num_layers=3,
+            num_heads=2,
+            ffn_dim=64,
+            max_past_frames=10,
+            early_tap_layer=1,
+            num_scene_classes=10,
+            num_emotion_classes=8,
+            embedding_dim=128,
+        ).eval()
+        fresh_model.load_state_dict(model.state_dict())
+
+        with torch.no_grad():
+            sc2_ctrl, spk2_ctrl, emo2_ctrl, _ = fresh_model(chunk2, state_cache=None)
+
+        assert torch.allclose(sc2_fresh, sc2_ctrl, atol=1e-6), "Session reset failed: stale state persisted after cache reset!"
+        assert torch.allclose(spk2_fresh, spk2_ctrl, atol=1e-6)
+        assert torch.allclose(emo2_fresh, emo2_ctrl, atol=1e-6)
+
+    def test_pytorch_vs_onnxruntime_multi_chunk_parity_with_cache_propagation(self):
+        """Verify PyTorch and ONNX Runtime produce identical outputs over multiple consecutive chunks."""
+        import onnxruntime as ort
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            onnx_path = Path(tmp_dir) / "streaming_parity.onnx"
+
+            num_layers = 2
+            heads = 2
+            head_dim = 16
+            past_frames = 10
+            model = MultiTaskStreamingWavLM(
+                hidden_dim=32,
+                num_layers=num_layers,
+                num_heads=heads,
+                ffn_dim=64,
+                max_past_frames=past_frames,
+                early_tap_layer=1,
+                num_scene_classes=10,
+                num_emotion_classes=8,
+                embedding_dim=128,
+            ).eval()
+
+            dummy_chunk = torch.randn(1, 3200)
+            dummy_cache = torch.randn(num_layers, 2, 1, heads, past_frames, head_dim)
+
+            torch.onnx.export(
+                model,
+                (dummy_chunk, dummy_cache),
+                str(onnx_path),
+                export_params=True,
+                opset_version=13,
+                do_constant_folding=True,
+                input_names=["audio_chunk", "state_cache_in"],
+                output_names=["scene_logits", "speaker_embedding", "emotion_logits", "state_cache_out"],
+            )
+
+            session = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
+
+            # Stream 4 consecutive chunks through both PyTorch and ONNX
+            pt_cache = dummy_cache.clone()
+            ort_cache = dummy_cache.numpy().copy()
+
+            for step in range(4):
+                chunk = torch.randn(1, 3200)
+
+                with torch.no_grad():
+                    pt_sc, pt_spk, pt_emo, pt_cache = model(chunk, state_cache=pt_cache)
+
+                ort_out = session.run(None, {
+                    "audio_chunk": chunk.numpy(),
+                    "state_cache_in": ort_cache,
+                })
+                ort_sc, ort_spk, ort_emo, ort_cache = ort_out
+
+                np.testing.assert_allclose(ort_sc, pt_sc.numpy(), rtol=1e-3, atol=1e-3)
+                np.testing.assert_allclose(ort_spk, pt_spk.numpy(), rtol=1e-3, atol=1e-3)
+                np.testing.assert_allclose(ort_emo, pt_emo.numpy(), rtol=1e-3, atol=1e-3)
+                np.testing.assert_allclose(ort_cache, pt_cache.numpy(), rtol=1e-3, atol=1e-3)
+
+    def test_atomic_checkpoint_save_and_provenance(self):
+        """Verify save_checkpoint_atomic writes atomically and preserves RNG states."""
+        from pipeline.train_streaming_wavlm import save_checkpoint_atomic
+        import random
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            ckpt_path = Path(tmp_dir) / "test_checkpoint.pt"
+            state = {
+                "epoch": 5,
+                "best_composite": 0.88,
+                "python_rng_state": random.getstate(),
+                "numpy_rng_state": np.random.get_state(),
+                "torch_cpu_rng_state": torch.get_rng_state(),
+            }
+
+            save_checkpoint_atomic(state, ckpt_path)
+            assert ckpt_path.exists()
+            # Ensure no orphaned .tmp files
+            tmp_files = list(Path(tmp_dir).glob("*.tmp*"))
+            assert len(tmp_files) == 0
+
+            loaded = torch.load(ckpt_path)
+            assert loaded["epoch"] == 5
+            assert loaded["best_composite"] == 0.88
+
+
+

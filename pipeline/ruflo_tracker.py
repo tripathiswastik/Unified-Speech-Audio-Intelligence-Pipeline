@@ -54,6 +54,8 @@ class RufloExperimentTracker:
             "hyperparameters": hyperparameters,
             "checkpoint": checkpoint_path,
         }
+        self.history = self._load_history()
+        self.history.setdefault("runs", []).append(run_record)
         temp_file = self.history_file.with_suffix(".tmp")
         with open(temp_file, "w", encoding="utf-8") as f:
             json.dump(self.history, f, indent=2)
