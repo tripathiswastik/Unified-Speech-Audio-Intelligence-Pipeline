@@ -4,8 +4,10 @@ import pytest
 import numpy as np
 import soundfile as sf
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
-from pipeline.server import app, MAX_UPLOAD_BYTES
+import pipeline.server as server_module
+from pipeline.server import app, MAX_UPLOAD_BYTES, MAX_WS_MESSAGE_BYTES
 from pipeline.config import SAMPLE_RATE
 
 
@@ -160,3 +162,112 @@ def test_analyzer_strict_mode_enforcement(monkeypatch):
     with pytest.raises(RuntimeError) as exc_info:
         pipeline.server.get_analyzer()
     assert "Trained checkpoints are strictly required" in str(exc_info.value)
+
+
+def test_analyze_empty_file_returns_400(client):
+    """Verify uploading an empty file (0 bytes) returns HTTP 400."""
+    response = client.post(
+        "/api/v1/analyze",
+        files={"file": ("empty.wav", b"", "audio/wav")},
+        data={"num_speakers": "0"},
+    )
+    assert response.status_code == 400
+    assert "empty" in response.json()["detail"].lower()
+
+
+def test_noise_validation_missing_or_invalid_class(client):
+    """Verify noise validation rejects missing or non-existent noise classes."""
+    duration = 0.5
+    t = np.linspace(0, duration, int(SAMPLE_RATE * duration), endpoint=False)
+    wave = (0.2 * np.sin(2 * np.pi * 440 * t)).astype(np.float32)
+    buf = io.BytesIO()
+    sf.write(buf, wave, SAMPLE_RATE, format="WAV")
+    buf.seek(0)
+
+    # Missing class
+    res1 = client.post(
+        "/api/v1/analyze",
+        files={"file": ("test.wav", buf.getvalue(), "audio/wav")},
+        data={"apply_noise": "true"},
+    )
+    assert res1.status_code == 422
+    assert "noise_class is required" in res1.json()["detail"]
+
+    # Invalid class
+    res2 = client.post(
+        "/api/v1/analyze",
+        files={"file": ("test.wav", buf.getvalue(), "audio/wav")},
+        data={"apply_noise": "true", "noise_class": "invalid_noise_class_xyz"},
+    )
+    assert res2.status_code == 422
+    assert "Invalid noise_class" in res2.json()["detail"]
+
+
+def test_api_key_authentication_enforcement(client, monkeypatch):
+    """Verify REST endpoint rejects requests when API Key is invalid or missing."""
+    monkeypatch.setattr(server_module, "SERVER_API_KEY", "test-secret-key-123")
+
+    # Missing API Key
+    res_no_key = client.post(
+        "/api/v1/analyze",
+        files={"file": ("test.wav", b"dummy", "audio/wav")},
+    )
+    assert res_no_key.status_code == 401
+    assert "Unauthorized" in res_no_key.json()["detail"]
+
+    # Invalid API Key
+    res_bad_key = client.post(
+        "/api/v1/analyze",
+        files={"file": ("test.wav", b"dummy", "audio/wav")},
+        headers={"x-api-key": "wrong-key"},
+    )
+    assert res_bad_key.status_code == 401
+
+
+def test_websocket_pcm16_streaming_and_malformed_handling(client):
+    """Verify PCM16 configuration, streaming, and non-fatal malformed audio handling."""
+    with client.websocket_connect("/ws/stream") as websocket:
+        init_event = websocket.receive_json()
+        assert init_event["event"] == "connected"
+
+        # Configure to PCM16
+        websocket.send_json({"action": "configure", "encoding": "pcm16"})
+        conf = websocket.receive_json()
+        assert conf["event"] == "configured"
+        assert conf["encoding"] == "pcm16"
+
+        # Stream valid PCM16 chunk
+        valid_pcm16 = np.zeros(int(0.2 * SAMPLE_RATE), dtype=np.int16).tobytes()
+        websocket.send_bytes(valid_pcm16)
+
+        # Send malformed ragged byte chunk (3 bytes: invalid for 16-bit PCM)
+        websocket.send_bytes(b"\x01\x02\x03")
+        err = websocket.receive_json()
+        assert err["event"] == "error"
+        assert err["code"] == "malformed_audio"
+        assert err["fatal"] is False
+
+
+def test_websocket_unauthorized_origin_rejection(client, monkeypatch):
+    """Verify WebSocket rejects connection from unauthorized origin."""
+    monkeypatch.setattr(server_module, "allow_origins", ["http://trusted-site.com"])
+
+    with pytest.raises(WebSocketDisconnect) as exc:
+        with client.websocket_connect("/ws/stream", headers={"origin": "http://untrusted-attacker.com"}):
+            pass
+    assert exc.value.code == 1008
+
+
+def test_websocket_oversize_message_rejection(client):
+    """Verify WebSocket rejects message frames exceeding MAX_WS_MESSAGE_BYTES."""
+    with pytest.raises(WebSocketDisconnect) as exc:
+        with client.websocket_connect("/ws/stream") as websocket:
+            _ = websocket.receive_json()
+            oversized_frame = b"\x00" * (MAX_WS_MESSAGE_BYTES + 1024)
+            websocket.send_bytes(oversized_frame)
+            err = websocket.receive_json()
+            assert err["event"] == "error"
+            assert err["code"] == "too_large"
+            _ = websocket.receive_text()
+    assert exc.value.code == 1009
+

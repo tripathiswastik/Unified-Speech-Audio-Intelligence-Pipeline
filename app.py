@@ -781,20 +781,24 @@ with tab_streaming:
         st.caption("Rolling chunk ingestion powered by our proprietary `StreamingDiarizer` (`SESpeakerEmbeddingNet`) and `StreamingPCEN`.")
 
         stream_mode = st.radio(
-            "Execution Mode",
-            ["Local simulation", "Live server"],
+            "Streaming Execution Mode",
+            ["Live Server (WebSocket)", "Local Simulation (In-Process)"],
             horizontal=True,
             key="stream_exec_mode",
+            help="Switch between connecting to the live FastAPI WebSocket server or running local in-memory simulation.",
         )
 
         ws_server_url = "ws://localhost:8000/ws/stream"
+        ws_api_key = ""
         realtime_pacing = False
 
-        if stream_mode == "Live server":
-            col_ws1, col_ws2 = st.columns([1.5, 1])
+        if stream_mode == "Live Server (WebSocket)":
+            col_ws1, col_ws2, col_ws3 = st.columns([1.5, 1, 1])
             with col_ws1:
                 ws_server_url = st.text_input("Server WebSocket URL", value="ws://localhost:8000/ws/stream", key="ws_server_url")
             with col_ws2:
+                ws_api_key = st.text_input("API Key (Optional)", value="", type="password", key="ws_api_key", help="Leave blank if server does not require authentication.")
+            with col_ws3:
                 realtime_pacing = st.checkbox("Real-time pacing (1.0x)", value=False, key="ws_rt_pacing")
 
         stream_audio_path, stream_label = render_audio_picker(
@@ -809,11 +813,11 @@ with tab_streaming:
         with col_c2:
             sim_energy_thresh = st.slider("VAD Speech Sensitivity (RMS)", min_value=0.005, max_value=0.10, value=0.015, step=0.005, key="sim_vad_thresh")
 
-        btn_label = "▶️ Stream to Live WebSocket Server" if stream_mode == "Live server" else "▶️ Launch Proprietary Model Stream Simulation"
+        btn_label = "▶️ Stream to Live WebSocket Server" if stream_mode == "Live Server (WebSocket)" else "▶️ Launch Local Model Stream Simulation"
         if st.button(btn_label, type="primary", key="btn_run_streaming"):
             if not (stream_audio_path and stream_audio_path.exists()):
                 st.warning("Please provide a valid audio source.")
-            elif stream_mode == "Live server":
+            elif stream_mode == "Live Server (WebSocket)":
                 # Security restriction: only allow localhost unless override set
                 allow_remote = os.getenv("DASHBOARD_ALLOW_REMOTE_LIVE", "0").strip().lower() in ("1", "true", "yes")
                 is_local = "localhost" in ws_server_url.lower() or "127.0.0.1" in ws_server_url
@@ -828,7 +832,11 @@ with tab_streaming:
                         chunk_samples = int((chunk_ms / 1000.0) * SAMPLE_RATE)
                         num_chunks = int(np.ceil(len(wave_stream) / chunk_samples))
 
-                        with connect(ws_server_url, close_timeout=3.0) as ws:
+                        headers = {}
+                        if ws_api_key.strip():
+                            headers["x-api-key"] = ws_api_key.strip()
+
+                        with connect(ws_server_url, additional_headers=headers or None, close_timeout=3.0) as ws:
                             handshake = json.loads(ws.recv())
                             if handshake.get("demo_mode"):
                                 st.warning("⚠️ Server Demo Mode: Connected server reports running with synthetic/unverified model weights.")
@@ -865,9 +873,23 @@ with tab_streaming:
                                     if realtime_pacing:
                                         time.sleep(chunk_ms / 1000.0)
 
-                                    # Collect any available server events (non-blocking)
-                                    # Event mapping:
-                                    # window -> speaker_turn, turn_start -> activity_start, turn_complete, speaker_shift
+                                    # Collect any available server events
+                                    try:
+                                        msg = ws.recv(timeout=0.005)
+                                        ev_data = json.loads(msg)
+                                        if ev_data.get("event") == "speech_segment":
+                                            spk = ev_data.get("speaker_tag", "Speaker")
+                                            conf = ev_data.get("confidence", 0.0)
+                                            t_s = ev_data.get("timestamp_start", 0.0)
+                                            t_e = ev_data.get("timestamp_end", 0.0)
+                                            event_log.append({
+                                                "Timestamp": f"{t_s:.2f}s - {t_e:.2f}s",
+                                                "Event Type": f"🗣️ speaker_turn ({spk})",
+                                                "Details": f"Confidence: {conf:.2f}",
+                                            })
+                                    except Exception:
+                                        pass
+
                                     chunk_rms = float(np.sqrt(np.mean(chunk**2))) if len(chunk) > 0 else 0.0
                                     if chunk_rms >= sim_energy_thresh:
                                         active_speech_chunks += 1
@@ -876,7 +898,7 @@ with tab_streaming:
 
                                 ws.send(json.dumps({"action": "reset"}))
                                 try:
-                                    _ = ws.recv()
+                                    _ = ws.recv(timeout=0.5)
                                 except Exception:
                                     pass
 
