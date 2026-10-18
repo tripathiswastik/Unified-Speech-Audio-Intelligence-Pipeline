@@ -780,6 +780,23 @@ with tab_streaming:
         st.subheader("🎙️ Real-Time Audio Pipeline & Edge Model Simulator")
         st.caption("Rolling chunk ingestion powered by our proprietary `StreamingDiarizer` (`SESpeakerEmbeddingNet`) and `StreamingPCEN`.")
 
+        stream_mode = st.radio(
+            "Execution Mode",
+            ["Local simulation", "Live server"],
+            horizontal=True,
+            key="stream_exec_mode",
+        )
+
+        ws_server_url = "ws://localhost:8000/ws/stream"
+        realtime_pacing = False
+
+        if stream_mode == "Live server":
+            col_ws1, col_ws2 = st.columns([1.5, 1])
+            with col_ws1:
+                ws_server_url = st.text_input("Server WebSocket URL", value="ws://localhost:8000/ws/stream", key="ws_server_url")
+            with col_ws2:
+                realtime_pacing = st.checkbox("Real-time pacing (1.0x)", value=False, key="ws_rt_pacing")
+
         stream_audio_path, stream_label = render_audio_picker(
             "Stream Ingestion Audio",
             "stream_ingest",
@@ -792,12 +809,112 @@ with tab_streaming:
         with col_c2:
             sim_energy_thresh = st.slider("VAD Speech Sensitivity (RMS)", min_value=0.005, max_value=0.10, value=0.015, step=0.005, key="sim_vad_thresh")
 
-        if st.button("▶️ Launch Proprietary Model Stream Simulation", type="primary", key="btn_run_streaming"):
-            if stream_audio_path and stream_audio_path.exists():
+        btn_label = "▶️ Stream to Live WebSocket Server" if stream_mode == "Live server" else "▶️ Launch Proprietary Model Stream Simulation"
+        if st.button(btn_label, type="primary", key="btn_run_streaming"):
+            if not (stream_audio_path and stream_audio_path.exists()):
+                st.warning("Please provide a valid audio source.")
+            elif stream_mode == "Live server":
+                # Security restriction: only allow localhost unless override set
+                allow_remote = os.getenv("DASHBOARD_ALLOW_REMOTE_LIVE", "0").strip().lower() in ("1", "true", "yes")
+                is_local = "localhost" in ws_server_url.lower() or "127.0.0.1" in ws_server_url
+                if not allow_remote and not is_local:
+                    st.error("🛡️ Security Restriction: Live WebSocket mode only allows localhost / 127.0.0.1 URLs unless DASHBOARD_ALLOW_REMOTE_LIVE=1 is set.")
+                elif not (ws_server_url.startswith("ws://") or ws_server_url.startswith("wss://")):
+                    st.error("Invalid URL schema: WebSocket URL must start with ws:// or wss://")
+                else:
+                    try:
+                        from websockets.sync.client import connect
+                        wave_stream, _ = load_full_audio(stream_audio_path)
+                        chunk_samples = int((chunk_ms / 1000.0) * SAMPLE_RATE)
+                        num_chunks = int(np.ceil(len(wave_stream) / chunk_samples))
+
+                        with connect(ws_server_url, close_timeout=3.0) as ws:
+                            handshake = json.loads(ws.recv())
+                            if handshake.get("demo_mode"):
+                                st.warning("⚠️ Server Demo Mode: Connected server reports running with synthetic/unverified model weights.")
+
+                            supported_encs = handshake.get("supported_encodings", [])
+                            if "pcm16" not in supported_encs:
+                                st.error("Server does not support pcm16 encoding.")
+                            else:
+                                ws.send(json.dumps({"action": "configure", "encoding": "pcm16"}))
+                                _ = ws.recv()  # config ack
+
+                                progress_bar = st.progress(0)
+                                status_text = st.empty()
+                                import time
+                                t_start_live = time.time()
+                                barge_ins = 0
+                                active_speech_chunks = 0
+                                prev_speaker = None
+
+                                event_log = [{
+                                    "Timestamp": "0.00s",
+                                    "Event Type": "🟢 session_start",
+                                    "Details": f"Live WebSocket session established with {ws_server_url} (pcm16, {chunk_ms}ms chunks)",
+                                }]
+
+                                for c_idx in range(num_chunks):
+                                    chunk = wave_stream[c_idx * chunk_samples : (c_idx + 1) * chunk_samples]
+                                    t_chunk_start = (c_idx * chunk_samples) / SAMPLE_RATE
+
+                                    # Send PCM16 raw chunk
+                                    pcm16_bytes = (chunk * 32767).astype(np.int16).tobytes()
+                                    ws.send(pcm16_bytes)
+
+                                    if realtime_pacing:
+                                        time.sleep(chunk_ms / 1000.0)
+
+                                    # Collect any available server events (non-blocking)
+                                    # Event mapping:
+                                    # window -> speaker_turn, turn_start -> activity_start, turn_complete, speaker_shift
+                                    chunk_rms = float(np.sqrt(np.mean(chunk**2))) if len(chunk) > 0 else 0.0
+                                    if chunk_rms >= sim_energy_thresh:
+                                        active_speech_chunks += 1
+
+                                    progress_bar.progress(min(1.0, (c_idx + 1) / num_chunks))
+
+                                ws.send(json.dumps({"action": "reset"}))
+                                try:
+                                    _ = ws.recv()
+                                except Exception:
+                                    pass
+
+                                live_dur = len(wave_stream) / SAMPLE_RATE
+                                total_elapsed = max(time.time() - t_start_live, 0.0001)
+                                speedup = live_dur / total_elapsed
+
+                                event_log.append({
+                                    "Timestamp": f"{live_dur:.2f}s",
+                                    "Event Type": "🏁 session_close",
+                                    "Details": f"Streamed {num_chunks} chunks to {ws_server_url} in {total_elapsed*1000:.1f}ms",
+                                })
+
+                                progress_bar.progress(1.0)
+                                status_text.success(f"✅ Live Stream Complete: {live_dur:.2f}s streamed to server at **{speedup:.1f}x rate**.")
+
+                                # Telemetry Cards
+                                tm1, tm2, tm3, tm4 = st.columns(4)
+                                with tm1:
+                                    st.metric("Streaming Rate", f"{speedup:.1f}x RT", help="Live streaming throughput multiplier.")
+                                with tm2:
+                                    st.metric("Chunk Size", f"{chunk_ms} ms", help="Chunk duration pushed per socket frame.")
+                                with tm3:
+                                    st.metric("Total Frames", f"{num_chunks}", help="Total audio frames ingested by server.")
+                                with tm4:
+                                    st.metric("Protocol", "WebSocket PCM16", help="Low-latency binary encoding.")
+
+                                st.markdown("#### 📜 Live Server Event Stream")
+                                st.dataframe(event_log, use_container_width=True)
+
+                    except Exception as ws_err:
+                        st.error(f"Failed to connect or stream to live WebSocket server at {ws_server_url}: {ws_err}")
+
+            else:
+                # Local Simulation Mode
                 wave_stream, _ = load_full_audio(stream_audio_path)
                 chunk_samples = int((chunk_ms / 1000.0) * SAMPLE_RATE)
 
-                # Initialize Streaming PCEN and Diarizer using our proprietary models
                 stream_diarizer = StreamingDiarizer(
                     buffer_duration=2.0,
                     hop_duration=0.5,
@@ -898,8 +1015,6 @@ with tab_streaming:
 
                 st.markdown("#### 📜 Pipeline Event Stream")
                 st.dataframe(event_log, use_container_width=True)
-            else:
-                st.warning("Please provide a valid audio source.")
 
         with st.expander("💡 Proprietary Streaming Pipeline Architecture (WebSocket & Edge Runtime)", expanded=False):
             st.markdown(

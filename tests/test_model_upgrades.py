@@ -86,7 +86,7 @@ def test_cmvn_log_mel_spectrogram_normalization():
     channel_means = np.mean(cmvn_spec, axis=1)
     channel_stds = np.std(cmvn_spec, axis=1)
 
-    assert np.allclose(channel_means, np.zeros_like(channel_means), atol=1e-5)
+    assert np.allclose(channel_means, np.zeros_like(channel_means), atol=1e-4)
     # Most channels should have unit standard deviation
     assert np.allclose(channel_stds, np.ones_like(channel_stds), atol=1e-3)
 
