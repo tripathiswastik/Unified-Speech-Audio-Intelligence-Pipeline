@@ -100,8 +100,10 @@ def test_live_rejects_unauthorized_origin(live_server, monkeypatch):
 
     if isinstance(exc.value, InvalidStatus):
         assert exc.value.response.status_code == 403
-    else:
+    elif exc.value.rcvd is not None:
         assert exc.value.rcvd.code == 1008
+    else:
+        assert exc.value.code == 1008
 
 
 def test_live_rejects_invalid_api_key(live_server, monkeypatch):
@@ -118,5 +120,7 @@ def test_live_rejects_invalid_api_key(live_server, monkeypatch):
 
     if isinstance(exc.value, InvalidStatus):
         assert exc.value.response.status_code == 403
-    else:
+    elif exc.value.rcvd is not None:
         assert exc.value.rcvd.code == 1008
+    else:
+        assert exc.value.code == 1008
