@@ -16,10 +16,10 @@ import sys
 import os
 import random
 import json
-from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Any
-import argparse
 import time
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional, Any, Union, Sequence
+import argparse
 import math
 import hashlib
 import numpy as np
@@ -318,7 +318,7 @@ class RAVDESSRawDataset(Dataset):
 
 
 def run_dataset_preflight_audit(
-    splits: Any,
+    splits: Union[Dict[str, Any], Sequence[Tuple[str, Any]]],
     max_verify_per_split: int = 5,
     min_samples: int = 1,
 ) -> Dict[str, Any]:
@@ -333,10 +333,10 @@ def run_dataset_preflight_audit(
     print("\n" + "=" * 80)
     print(" PREFLIGHT DATASET INTEGRITY AUDIT")
     print("=" * 80)
-    audit_results = {}
-    items = splits.items() if isinstance(splits, dict) else splits
+    audit_results: Dict[str, Any] = {}
+    items: Sequence[Tuple[str, Any]] = list(splits.items()) if isinstance(splits, dict) else list(splits)
     for name, ds in items:
-        count = len(ds)
+        count: int = len(ds) if hasattr(ds, "__len__") else 0
         if count < min_samples:
             raise ValueError(f"[Preflight Audit Failed] Dataset split '{name}' has {count} samples, fewer than required min_samples={min_samples}.")
 
