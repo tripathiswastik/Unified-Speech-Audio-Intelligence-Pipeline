@@ -6,6 +6,7 @@ Validates:
 3. Multi-task head outputs (Scene, Voiceprint, Emotion).
 4. Static-shape ONNX export and ONNX Runtime inference numerical equivalence.
 """
+from typing import Any
 import tempfile
 from pathlib import Path
 import numpy as np
@@ -605,8 +606,8 @@ class TestEvaluationMetricEdgeCases:
         """Linearly separable genuine and impostor scores must yield EER=0.0 and AUC=1.0."""
         from pipeline.train_streaming_wavlm import compute_equal_error_rate
 
-        genuine = [0.80, 0.85, 0.90, 0.95]
-        impostor = [0.10, 0.20, 0.25, 0.30]
+        genuine = np.array([0.80, 0.85, 0.90, 0.95], dtype=np.float64)
+        impostor = np.array([0.10, 0.20, 0.25, 0.30], dtype=np.float64)
 
         eer, auc, th = compute_equal_error_rate(genuine, impostor)
         assert eer == 0.0, f"Expected 0.0 EER for perfect separation, got {eer}"
@@ -617,8 +618,8 @@ class TestEvaluationMetricEdgeCases:
         """Identical score distributions must yield EER=0.5 and AUC=0.5."""
         from pipeline.train_streaming_wavlm import compute_equal_error_rate
 
-        genuine = [0.5, 0.5, 0.5, 0.5]
-        impostor = [0.5, 0.5, 0.5, 0.5]
+        genuine = np.array([0.5, 0.5, 0.5, 0.5], dtype=np.float64)
+        impostor = np.array([0.5, 0.5, 0.5, 0.5], dtype=np.float64)
 
         eer, auc, th = compute_equal_error_rate(genuine, impostor)
         assert np.isclose(eer, 0.5, atol=1e-3), f"Expected 0.5 EER for overlapping distributions, got {eer}"
@@ -630,27 +631,27 @@ class TestEvaluationMetricEdgeCases:
         from pipeline.train_streaming_wavlm import compute_equal_error_rate
 
         # Non-strict mode should return (nan, nan, 0.0) without silently returning a misleading 0.5
-        eer, auc, th = compute_equal_error_rate([], [0.1, 0.2], strict=False)
+        eer, auc, th = compute_equal_error_rate(np.array([], dtype=np.float64), np.array([0.1, 0.2], dtype=np.float64), strict=False)
         assert math.isnan(eer)
         assert math.isnan(auc)
 
-        eer2, auc2, th2 = compute_equal_error_rate([0.8, 0.9], [], strict=False)
+        eer2, auc2, th2 = compute_equal_error_rate(np.array([0.8, 0.9], dtype=np.float64), np.array([], dtype=np.float64), strict=False)
         assert math.isnan(eer2)
         assert math.isnan(auc2)
 
         # Strict mode must fail loudly
         with pytest.raises(ValueError):
-            compute_equal_error_rate([], [0.1, 0.2], strict=True)
+            compute_equal_error_rate(np.array([], dtype=np.float64), np.array([0.1, 0.2], dtype=np.float64), strict=True)
 
         with pytest.raises(ValueError):
-            compute_equal_error_rate([0.8, 0.9], [], strict=True)
+            compute_equal_error_rate(np.array([0.8, 0.9], dtype=np.float64), np.array([], dtype=np.float64), strict=True)
 
     def test_compute_equal_error_rate_tied_scores_and_extreme_range(self):
         """Handles scores spanning the entire [-1.0, 1.0] cosine similarity range with ties."""
         from pipeline.train_streaming_wavlm import compute_equal_error_rate
 
-        genuine = [-0.1, 0.4, 0.4, 0.7, 0.9]
-        impostor = [-0.9, -0.5, 0.4, 0.4, 0.6]
+        genuine = np.array([-0.1, 0.4, 0.4, 0.7, 0.9], dtype=np.float64)
+        impostor = np.array([-0.9, -0.5, 0.4, 0.4, 0.6], dtype=np.float64)
 
         eer, auc, th = compute_equal_error_rate(genuine, impostor)
         assert 0.0 <= eer <= 1.0
@@ -719,7 +720,7 @@ class TestSplitDeterminismAndTrialManifests:
             def __getitem__(self, index):
                 return torch.zeros(16000), self.labels[index]
 
-        ds_single = SingleFileSpeakerDataset()
+        ds_single: Any = SingleFileSpeakerDataset()
 
         # In strict mode (fail_on_insufficient=True), it must raise ValueError
         with pytest.raises(ValueError) as exc:
