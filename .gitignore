@@ -31,8 +31,6 @@ DataSet/
 UrbanSound8K/audio/
 wav/
 wo/
-hdfc/
-hcl/
 *.zip
 *.tar.gz
 *.tgz
