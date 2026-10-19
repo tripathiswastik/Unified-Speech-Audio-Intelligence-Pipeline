@@ -171,45 +171,54 @@ The production FastAPI server exposes a bidirectional real-time audio streaming 
 
 ## 📁 Repository Structure
 
-```
+```text
+UrbanSound/
 ├── app.py                             # Interactive Streamlit Audio Intelligence Hub
-├── pipeline/
-│   ├── streaming_wavlm.py             # Causal Chunk-Based Multi-Task Streaming WavLM
-│   ├── train_streaming_wavlm.py       # Joint Multi-Task PyTorch Training Pipeline
-│   ├── validate_edge_onnx.py          # Edge ONNX Numerical Parity & Latency Profiler
-│   ├── validate_environment.py       # Preflight Environment & Dataset Corpus Diagnostic
-│   ├── bench_cuda.py                  # PyTorch GPU (CUDA) & Hardware Profiler
-│   ├── live_client.py                 # Live Full-Duplex WebSocket Client Utility
-│   ├── onnx_exporter.py               # Strict Checkpoint ONNX / TensorRT Export Engine
-│   ├── server.py                      # FastAPI ASGI Server & WebSocket Streaming Gateway
-│   ├── unified_analyzer.py            # Multi-Task Unified Audio Inference Engine
-│   ├── streaming.py                   # Real-time Streaming PCEN & Diarization
-│   ├── model.py                       # AudioCNN & SEAudioCNN Architecture Definitions
-│   ├── speaker_id.py                  # SESpeakerEmbeddingNet & ArcFace Verification
-│   ├── emotion_model.py               # Speech Emotion Recognition (SER) Classifier
-│   ├── dataset.py                     # UrbanSound8K Dataset & SpecAugment
-│   ├── emotion_dataset.py             # RAVDESS Emotion Dataset & Noise Corrupter
-│   ├── audio_loader.py                # Robust Multi-Format Audio Decoding & Preprocessing
-│   ├── urban_noise_mixer.py           # Real-World Urban Noise Injection & SNR Control
-│   ├── ruflo_tracker.py               # Metric Registry & Cross-Validation Tracker
-│   └── device.py                      # Dynamic Hardware Engine Selector (CUDA/CPU)
-├── tests/
-│   ├── test_streaming_wavlm.py        # Causal Attention Invariants & Multi-Task Tests
-│   ├── test_streaming_and_onnx.py     # Streaming PCEN & ONNX Numerical Match Tests
-│   ├── test_server.py                 # FastAPI REST Endpoints & WebSocket Tests
-│   ├── test_server_hardening.py       # Payload Limits & CORS Security Tests
-│   ├── test_live_client.py            # Real Live WebSocket Client Integration Tests
-│   ├── test_speaker_and_diarization.py# Voiceprints & Diarization Clustering Tests
-│   ├── test_model_upgrades.py         # Squeeze-and-Excitation CNN Architecture Tests
-│   ├── test_inference_pipeline.py     # End-to-End Inference & Audio Loader Tests
-│   ├── test_audio_loader.py           # Multi-Format Audio Decoding Suite
-│   └── test_config.py                 # Filepath & Environment Consistency Tests
-├── pipeline_output/
-│   ├── checkpoints/                   # Trained Checkpoints (.pt) and Exported Engines (.onnx)
-│   ├── manifests/                     # Disjoint Dataset Partition & Trial Manifests
-│   ├── edge_onnx_validation_report.json # Detailed Hardware Profiling Report
-│   └── ruflo_experiment_history.json  # Comprehensive Training Experiment Log
-└── pyproject.toml                     # Python Package & Test Configuration
+│
+├── pipeline/                          # Streaming audio processing & modeling core
+│   ├── streaming_wavlm.py             # Causal chunk-based multi-task streaming WavLM
+│   ├── train_streaming_wavlm.py       # Multi-task PyTorch training pipeline
+│   ├── validate_edge_onnx.py          # Edge ONNX numerical parity & latency profiler
+│   ├── onnx_exporter.py               # ONNX / TensorRT export engine
+│   ├── server.py                      # FastAPI ASGI server & WebSocket streaming gateway
+│   ├── live_client.py                 # Full-duplex WebSocket live streaming client
+│   ├── unified_analyzer.py            # Unified multi-task audio inference engine
+│   ├── streaming.py                   # Real-time streaming PCEN & diarization
+│   ├── model.py                       # AudioCNN & SEAudioCNN architecture definitions
+│   ├── speaker_id.py                  # Speaker embedding network & ArcFace verification
+│   ├── emotion_model.py               # Speech emotion recognition classifier
+│   ├── dataset.py                     # UrbanSound8K dataset loader with SpecAugment
+│   ├── emotion_dataset.py             # RAVDESS dataset loader with noise corruption
+│   ├── audio_loader.py                # Robust multi-format audio decoding & preprocessing
+│   ├── urban_noise_mixer.py           # Real-world noise injection with SNR control
+│   ├── ruflo_tracker.py               # Experiment tracking & metric registry
+│   ├── bench_cuda.py                  # PyTorch GPU & CUDA hardware profiler
+│   ├── validate_environment.py       # Preflight hardware & dataset diagnostics
+│   └── device.py                      # Dynamic hardware acceleration selector (CUDA/CPU)
+│
+├── tests/                             # Comprehensive unit & integration test suite
+│   ├── test_streaming_wavlm.py        # Causal attention invariants & multi-task tests
+│   ├── test_streaming_and_onnx.py     # Streaming PCEN & ONNX numerical parity
+│   ├── test_server.py                 # FastAPI REST endpoints & WebSocket tests
+│   ├── test_server_hardening.py       # Security, payload limits, and CORS tests
+│   ├── test_live_client.py            # Live WebSocket client communication tests
+│   ├── test_speaker_and_diarization.py# Voiceprints & diarization clustering tests
+│   ├── test_model_upgrades.py         # Squeeze-and-Excitation CNN architecture tests
+│   ├── test_inference_pipeline.py     # End-to-end inference verification
+│   ├── test_audio_loader.py           # Multi-format audio decoding tests
+│   └── test_config.py                 # Filepath & environment configuration tests
+│
+├── pipeline_output/                   # Checkpoints & evaluation artifacts
+│   ├── checkpoints/                   # Trained PyTorch (.pt) and exported ONNX (.onnx) models
+│   ├── manifests/                     # Disjoint dataset partition & trial manifests
+│   ├── edge_onnx_validation_report.json # Latency profiling & parity report
+│   └── ruflo_experiment_history.json  # Comprehensive training experiment logs
+│
+├── Dockerfile                         # Container definition for audio inference & server
+├── requirements.txt                   # Production runtime dependencies
+├── requirements-dev.txt               # Testing and profiling dependencies
+├── pyproject.toml                     # Package metadata, tool configurations, and lint rules
+└── README.md                          # Architecture specification & usage documentation
 ```
 
 ---
