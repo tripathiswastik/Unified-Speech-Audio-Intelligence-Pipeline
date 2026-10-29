@@ -33,6 +33,42 @@ A multi-task acoustic intelligence and real-time streaming pipeline designed for
 
 ## 🏗️ Architecture & Multi-Task Design
 
+```mermaid
+flowchart TD
+    Chunk["Raw Audio Stream<br/>(200ms = 3,200 samples @ 16kHz)"]
+    Conv["Causal 1D-Conv Feature Encoder<br/>(320x Downsampling)"]
+    L1["WavLM Transformer Layer 1"]
+    L2["WavLM Transformer Layer 2"]
+    L3_5["WavLM Transformer Layers 3 - 5"]
+    L6["WavLM Transformer Layer 6"]
+
+    Chunk --> Conv --> L1 --> L2
+    
+    subgraph EarlyTap["Early-Layer Tap (Layer 2)"]
+        SceneHead["Environmental Scene Classifier<br/>• SpecAugment + SE-CNN<br/>• 10-Class UrbanSound8K / ESC-50"]
+    end
+    L2 -->|Early Tap| SceneHead
+    L2 --> L3_5 --> L6
+
+    subgraph DeepTap["Deep-Layer Tap (Layer 6)"]
+        VoiceHead["Speaker Voiceprint Head<br/>• Temporal Statistics Pooling<br/>• 128-d L2 ArcFace Hypersphere"]
+        EmotionHead["Speech Emotion Head (SER)<br/>• Attentive Temporal Pooling<br/>• 8-Class RAVDESS Prosody"]
+    end
+    L6 -->|Deep Tap| VoiceHead
+    L6 -->|Deep Tap| EmotionHead
+
+    subgraph Edge["Real-Time Edge Runtime"]
+        ONNX["Static ONNX Graph / TensorRT<br/>15.18ms Latency • 13.2x Real-Time"]
+        WS["FastAPI WebSocket Gateway<br/>ws://localhost:8000/ws/stream"]
+    end
+    VoiceHead --> ONNX
+    EmotionHead --> ONNX
+    SceneHead --> ONNX
+    ONNX --> WS
+```
+
+### Layer Tap Flow Diagram
+
 ```
                       [ Raw Audio Chunk (200ms = 3,200 samples) ]
                                           │
