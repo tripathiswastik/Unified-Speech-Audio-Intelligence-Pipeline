@@ -266,6 +266,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ---
 
 ## 🏷️ Repository Metadata & Topic Tags
-- **Core Topics**: `speech-processing` `wavlm` `audio-intelligence` `fastapi` `ai-agents` `python`
+- **About Description**: Sub-50ms edge streaming audio intelligence pipeline using causal WavLM, ArcFace speaker voiceprints, RAVDESS SER, and production FastAPI WebSockets.
+- **Core Topics**: `speech-processing` `wavlm` `audio-intelligence` `speaker-recognition` `arcface` `fastapi` `onnx-runtime` `tensorrt` `ai-agents` `pytorch`
 - **Governance**: Follows [Antigravity AI Rules](file:///d:/ag-ai/.agents/rules/antigravity-rules.md) and [Multi-Agent SDLC Contracts](file:///d:/ag-ai/.agents/rules/multi-agent-prompts.md).
 
