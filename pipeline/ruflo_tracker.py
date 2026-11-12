@@ -1,13 +1,16 @@
 """Ruflo Integration & Experiment Lineage Tracker for UrbanSound.
 Records training metadata, cross-validation metrics, and agent topology logs.
 """
-from pathlib import Path
-from typing import Dict, Any, List
+import logging
 import json
 import time
+from pathlib import Path
+from typing import Dict, Any, List
 import numpy as np
 
 from pipeline.config import OUTPUT_DIR, CLASSES
+
+logger = logging.getLogger(__name__)
 
 
 class RufloExperimentTracker:
@@ -23,8 +26,8 @@ class RufloExperimentTracker:
             try:
                 with open(self.history_file, "r", encoding="utf-8") as f:
                     return json.load(f)
-            except Exception:
-                pass
+            except (json.JSONDecodeError, OSError) as err:
+                logger.warning("Could not read history from %s: %s", self.history_file, err)
         return {
             "project": "UrbanSound8K",
             "taxonomy": CLASSES,

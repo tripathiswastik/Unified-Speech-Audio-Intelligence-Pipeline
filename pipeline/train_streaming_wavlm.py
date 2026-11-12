@@ -17,6 +17,7 @@ import os
 import random
 import json
 import time
+import logging
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any, Union, Sequence
 import argparse
@@ -27,6 +28,8 @@ import pandas as pd
 import soundfile as sf
 import librosa
 import torch
+
+logger = logging.getLogger(__name__)
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -605,8 +608,8 @@ def run_dataset_preflight_audit(
                 "excluded_count": len(excluded_files),
                 "status": "PASS",
             }, f_out, indent=2)
-    except Exception:
-        pass
+    except (OSError, TypeError) as err:
+        logger.warning("Failed writing integrity cache: %s", err)
 
     print("=" * 80)
     print(" [Preflight Audit Passed] All dataset splits and trials structurally verified & disjoint.\n")

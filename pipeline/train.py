@@ -1,5 +1,6 @@
 """Training & Validation Script for UrbanSound8K with Fold Isolation & Ruflo Tracking."""
 import argparse
+import logging
 from typing import List, Dict, Any
 from pathlib import Path
 import torch
@@ -9,6 +10,8 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from sklearn.metrics import accuracy_score, f1_score
 import numpy as np
 from tqdm import tqdm
+
+logger = logging.getLogger(__name__)
 
 from pipeline.config import (
     CHECKPOINTS_DIR,
@@ -195,8 +198,8 @@ def run_cross_validation(
                     "checkpoint": str(chk),
                 })
                 continue
-            except Exception:
-                pass
+            except (OSError, RuntimeError, KeyError) as err:
+                logger.warning("Failed loading checkpoint %s: %s", chk, err)
 
         res = run_training(
             test_fold=f,
