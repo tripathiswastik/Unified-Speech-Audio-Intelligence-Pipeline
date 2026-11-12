@@ -1,10 +1,13 @@
 """PyTorch Dataset & DataLoaders for UrbanSound8K with SpecAugment and Official Fold Split."""
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict
+import logging
 import pandas as pd
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
+
+logger = logging.getLogger(__name__)
 
 from collections import OrderedDict
 from pipeline.config import AUDIO_DIR, METADATA_CSV, CACHE_DIR
@@ -101,8 +104,8 @@ class UrbanSoundDataset(Dataset):
                 if self.cache_to_disk:
                     try:
                         np.save(str(disk_path), spec)
-                    except Exception:
-                        pass
+                    except OSError as cache_err:
+                        logger.debug("Disk cache write failed for %s: %s", disk_path, cache_err)
 
             # Store in bounded LRU cache
             if len(self._LRU_CACHE) >= self._MAX_LRU_ENTRIES:

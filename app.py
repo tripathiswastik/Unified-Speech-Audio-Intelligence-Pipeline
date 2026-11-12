@@ -11,6 +11,7 @@ import io
 import os
 import re
 import json
+import logging
 import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -19,6 +20,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 import soundfile as sf
 import torch
+
+logger = logging.getLogger(__name__)
 
 from pipeline.config import BASE_DIR, AUDIO_DIR, CHECKPOINTS_DIR, SAMPLE_RATE, CLASSES
 from pipeline.audio_loader import load_full_audio, compute_log_mel_spectrogram
@@ -96,8 +99,8 @@ if "session_enrolled_speakers" not in st.session_state:
                         if analyzer_ready and analyzer is not None:
                             emb = analyzer.speaker_identifier.extract_embedding(wave)
                             st.session_state["session_enrolled_speakers"][f"Speaker_{spk_id}"] = emb
-                    except Exception:
-                        pass
+                    except (RuntimeError, ValueError, OSError) as enroll_err:
+                        logger.warning("Default speaker enrollment failed for %s: %s", spk_id, enroll_err)
 
 # Synchronize session enrollments with analyzer's identifier
 if analyzer_ready and analyzer is not None:
@@ -887,8 +890,8 @@ with tab_streaming:
                                                 "Event Type": f"🗣️ speaker_turn ({spk})",
                                                 "Details": f"Confidence: {conf:.2f}",
                                             })
-                                    except Exception:
-                                        pass
+                                    except (json.JSONDecodeError, KeyError, ValueError) as ws_parse_err:
+                                        logger.debug("Failed to parse websocket event: %s", ws_parse_err)
 
                                     chunk_rms = float(np.sqrt(np.mean(chunk**2))) if len(chunk) > 0 else 0.0
                                     if chunk_rms >= sim_energy_thresh:
@@ -899,8 +902,8 @@ with tab_streaming:
                                 ws.send(json.dumps({"action": "reset"}))
                                 try:
                                     _ = ws.recv(timeout=0.5)
-                                except Exception:
-                                    pass
+                                except (TimeoutError, OSError) as ws_drain_err:
+                                    logger.debug("Websocket drain on reset timed out: %s", ws_drain_err)
 
                                 live_dur = len(wave_stream) / SAMPLE_RATE
                                 total_elapsed = max(time.time() - t_start_live, 0.0001)

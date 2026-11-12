@@ -1339,7 +1339,6 @@ def main():
         f"  - RAVDESS:     {len(ds_ravdess_train)} train (1-18), {len(ds_ravdess_val)} val (19-20), {len(ds_ravdess_test)} test (21-24)\n"
     )
 
-    # Initialize Causal Multi-Task Model
     model = CausalMultiTaskAudioTransformer(
         hidden_dim=256,
         num_layers=6,

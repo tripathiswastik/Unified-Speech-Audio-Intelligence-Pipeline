@@ -1,6 +1,6 @@
 """UrbanSound8K Noise Mixer.
 Dynamically injects realistic urban environmental noise into speech at configurable SNR levels.
-Supports multi-clip seamless chaining and crossfading for long audio streams.
+Supports multi-clip concatenative chaining and crossfading for long audio streams.
 """
 import os
 from pathlib import Path
@@ -156,7 +156,10 @@ class UrbanNoiseMixer:
 
         if has_audio and has_meta and not force_synthetic:
             try:
-                df = pd.read_csv(self.metadata_csv)
+                raw_df = pd.read_csv(self.metadata_csv)
+                if not isinstance(raw_df, pd.DataFrame):
+                    raw_df = raw_df.read()
+                df: pd.DataFrame = raw_df
                 if classes:
                     df = df[df["class"].isin(classes)]
                 if folds:
@@ -185,7 +188,7 @@ class UrbanNoiseMixer:
         target_samples: int = TARGET_SAMPLES,
         target_class: Optional[str] = None,
     ) -> Tuple[np.ndarray, str]:
-        """Randomly sample and load UrbanSound8K noise, seamlessly chaining clips if target is long.
+        """Randomly sample and load UrbanSound8K noise, chaining clips with crossfades if target is long.
         
         Falls back to synthesized acoustic noise if audio files are unpopulated.
         """

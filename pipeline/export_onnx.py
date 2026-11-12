@@ -30,8 +30,8 @@ def main():
             import torch
             print(f"PyTorch Version: {torch.__version__}", file=sys.stderr)
             print(f"CUDA Available: {torch.cuda.is_available()}", file=sys.stderr)
-        except Exception:
-            pass
+        except ImportError as torch_err:
+            print(f"PyTorch not available: {torch_err}", file=sys.stderr)
 
         try:
             import onnx
@@ -46,18 +46,21 @@ def main():
             print(f"ONNX Runtime Import Error: {ort_err}", file=sys.stderr)
 
         try:
-            import onnxscript
+            import importlib
+            onnxscript = importlib.import_module("onnxscript")
             print(f"ONNX Script Version: {getattr(onnxscript, '__version__', 'unknown')}", file=sys.stderr)
         except Exception as os_err:
             print(f"ONNX Script Import Error: {os_err}", file=sys.stderr)
 
         try:
             import pkg_resources
-            print("\nInstalled Packages:", file=sys.stderr)
-            for p in sorted(pkg_resources.working_set, key=lambda p: p.project_name.lower()):
-                print(f"  {p.project_name}=={p.version}", file=sys.stderr)
-        except Exception:
-            pass
+            ws = getattr(pkg_resources, "working_set", None)
+            if ws is not None:
+                print("\nInstalled Packages:", file=sys.stderr)
+                for p in sorted(list(ws), key=lambda x: str(getattr(x, "project_name", "")).lower()):
+                    print(f"  {getattr(p, 'project_name', 'unknown')}=={getattr(p, 'version', 'unknown')}", file=sys.stderr)
+        except Exception as pkg_err:
+            print(f"Package inspection unavailable: {pkg_err}", file=sys.stderr)
 
         sys.stderr.flush()
         sys.stdout.flush()

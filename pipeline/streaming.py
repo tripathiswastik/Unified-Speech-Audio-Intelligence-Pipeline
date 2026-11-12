@@ -286,7 +286,6 @@ class StreamingDiarizer:
                 )
                 emitted.append(shift_ev)
 
-                # Initialize new turn
                 self.current_turn_speaker = detected_spk
                 self.current_turn_start = event.timestamp_start
                 self.current_turn_end = event.timestamp_end
